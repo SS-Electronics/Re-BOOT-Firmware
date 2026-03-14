@@ -36,20 +36,20 @@ along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
 
 #if (BOOT_INTERFACE == BL_INTERFACE_UART)
 
-/**
- * @brief Pointer to registered UART operations
- */
+/* Registered UART hardware implementation */
 static const uart_ops_t *uart_operations = NULL;
 
+/* RX ring buffer */
+static uint8_t uart_rx_buffer[UART_RX_BUFFER_SIZE];
+
+static volatile uint16_t uart_rx_head = 0;
+static volatile uint16_t uart_rx_tail = 0;
+
 
 /**
- * @brief Register UART operations
- *
- * Stores the UART hardware implementation provided by the application.
- *
- * @param ops Pointer to UART operations structure
+ * @brief Register UART driver
  */
-void uart_driver_register(const uart_ops_t *ops)
+void bl_uart_driver_register(const uart_ops_t *ops)
 {
     uart_operations = ops;
 }
@@ -57,12 +57,6 @@ void uart_driver_register(const uart_ops_t *ops)
 
 /**
  * @brief Initialize UART
- *
- * Calls the hardware-specific initialization routine.
- *
- * @return
- *  - 0 on success
- *  - -1 if driver not registered
  */
 int32_t uart_init(void)
 {
@@ -78,9 +72,7 @@ int32_t uart_init(void)
 
 
 /**
- * @brief Close UART driver
- *
- * Calls the hardware-specific close routine.
+ * @brief Close UART
  */
 void uart_close(void)
 {
@@ -92,16 +84,7 @@ void uart_close(void)
 
 
 /**
- * @brief Transmit UART data
- *
- * Sends raw data through the registered UART driver.
- *
- * @param data Pointer to transmit buffer
- * @param len Number of bytes to transmit
- *
- * @return
- *  - Number of bytes transmitted
- *  - -1 if driver not registered
+ * @brief UART transmit
  */
 int uart_transmit(const uint8_t *data, uint16_t len)
 {
@@ -115,25 +98,78 @@ int uart_transmit(const uint8_t *data, uint16_t len)
 
 
 /**
- * @brief Receive UART data
- *
- * Reads data from the registered UART driver.
- *
- * @param data Pointer to receive buffer
- * @param maxlen Maximum number of bytes to receive
- *
- * @return
- *  - Number of bytes received
- *  - -1 if driver not registered
+ * @brief UART receive
  */
-int uart_receive(uint8_t *data, uint16_t maxlen)
+int uart_receive(uint8_t *data,
+                 uint16_t maxlen,
+                 uart_data_src_t source)
 {
-    if ((uart_operations == NULL) || (uart_operations->receive == NULL))
+    uint16_t count = 0;
+
+    if (data == NULL)
     {
         return -1;
     }
 
-    return uart_operations->receive(data, maxlen);
+    switch(source)
+    {
+        case UART_PERIPHERAL:
+
+            if ((uart_operations == NULL) || (uart_operations->receive == NULL))
+            {
+                return -1;
+            }
+
+            return uart_operations->receive(data, maxlen);
+
+
+        case UART_BUFFER:
+
+            while ((uart_rx_tail != uart_rx_head) && (count < maxlen))
+            {
+                data[count++] = uart_rx_buffer[uart_rx_tail];
+
+                uart_rx_tail = (uart_rx_tail + 1) % UART_RX_BUFFER_SIZE;
+            }
+
+            return count;
+
+
+        default:
+            return -1;
+    }
+}
+
+
+/**
+ * @brief UART RX byte callback
+ *
+ * Called from UART ISR.
+ */
+void drv_cb_uart_rx_byte(uint8_t byte)
+{
+    uint16_t next = (uart_rx_head + 1) % UART_RX_BUFFER_SIZE;
+
+    /* Prevent overflow */
+    if (next != uart_rx_tail)
+    {
+        uart_rx_buffer[uart_rx_head] = byte;
+        uart_rx_head = next;
+    }
+}
+
+
+/**
+ * @brief Bytes available in RX buffer
+ */
+uint16_t drv_cb_uart_bytes_available(void)
+{
+    if (uart_rx_head >= uart_rx_tail)
+    {
+        return uart_rx_head - uart_rx_tail;
+    }
+
+    return UART_RX_BUFFER_SIZE - uart_rx_tail + uart_rx_head;
 }
 
 #endif

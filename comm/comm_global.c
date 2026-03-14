@@ -1,10 +1,10 @@
 /*
-File:        bl_types.h
+File:        comm_global.c
 Author:      Subhajit Roy
              subhajitroy005@gmail.com
 
 Module:      Include
-Info:        Generic types and includes across project
+Info:        Global Data for communication
 Dependency:  None
 
 This file is part of Re-BOOT Firmware Project.
@@ -22,28 +22,7 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
 */
-#ifndef __INCLUDE_BL_TYPES_H__
-#define __INCLUDE_BL_TYPES_H__
 
-#include <stdio.h>
-#include <stdint.h>
-#include <stddef.h>
-#include <inttypes.h>
+#include "global.h"
 
 
-#define COMM_MAX_DATA 64
-
-/**
- * @brief Generic communication packet
- */
-typedef struct
-{
-    uint32_t command;              /**< Command identifier */
-    uint16_t length;               /**< Payload length */
-    uint8_t  data[COMM_MAX_DATA];  /**< Payload buffer */
-
-} comm_packet_t;
-
-
-
-#endif /* __INCLUDE_BL_TYPES_H__ */

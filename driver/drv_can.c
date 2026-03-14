@@ -26,26 +26,30 @@ along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
 
 /**
  * @file drv_can.c
- * @brief CAN driver abstraction implementation
+ * @brief CAN driver abstraction with RX buffer
  *
  * This module forwards CAN API calls to the hardware-specific
- * implementation registered by the application.
+ * implementation and provides a software RX buffer.
  */
 
 #include "drv_can.h"
 
 #if (BOOT_INTERFACE == BL_INTERFACE_CAN)
 
-/**
- * @brief Pointer to registered CAN operations
- */
+/* Registered CAN hardware implementation */
 static const can_ops_t *can_operations = NULL;
 
+/* RX ring buffer */
+static can_frame_t can_rx_buffer[CAN_RX_BUFFER_SIZE];
+
+static volatile uint16_t can_rx_head = 0;
+static volatile uint16_t can_rx_tail = 0;
+
 
 /**
- * @brief Register CAN operations
+ * @brief Register CAN driver
  */
-void can_driver_register(const can_ops_t *ops)
+void bl_can_driver_register(const can_ops_t *ops)
 {
     can_operations = ops;
 }
@@ -80,11 +84,9 @@ void can_close(void)
 
 
 /**
- * @brief Transmit CAN frame
+ * @brief CAN transmit
  */
-int can_transmit(uint32_t id,
-                 const uint8_t *data,
-                 uint8_t len)
+int can_transmit(uint32_t id, const uint8_t *data, uint8_t len)
 {
     if ((can_operations == NULL) || (can_operations->transmit == NULL))
     {
@@ -96,18 +98,78 @@ int can_transmit(uint32_t id,
 
 
 /**
- * @brief Receive CAN frame
+ * @brief CAN receive
+ *
+ * @param frame      Pointer to store received frame
+ * @param source     UART_PERIPHERAL or UART_BUFFER equivalent for CAN
  */
-int can_receive(uint32_t *id,
-                uint8_t *data,
-                uint8_t maxlen)
+int can_receive(can_frame_t *frame, can_data_src_t source)
 {
-    if ((can_operations == NULL) || (can_operations->receive == NULL))
+    if (frame == NULL)
     {
         return -1;
     }
 
-    return can_operations->receive(id, data, maxlen);
+    uint16_t count = 0;
+
+    switch(source)
+    {
+        case CAN_PERIPHERAL:
+
+            if ((can_operations == NULL) || (can_operations->receive == NULL))
+            {
+                return -1;
+            }
+
+            return can_operations->receive(frame);
+
+        case CAN_BUFFER:
+
+            if (can_rx_tail == can_rx_head)
+            {
+                return 0; // no frames available
+            }
+
+            *frame = can_rx_buffer[can_rx_tail];
+            can_rx_tail = (can_rx_tail + 1) % CAN_RX_BUFFER_SIZE;
+
+            return 1;
+
+        default:
+            return -1;
+    }
+}
+
+
+/**
+ * @brief CAN RX frame callback
+ *
+ * Called from CAN ISR.
+ */
+void drv_cb_can_rx_frame(const can_frame_t *frame)
+{
+    uint16_t next = (can_rx_head + 1) % CAN_RX_BUFFER_SIZE;
+
+    /* Prevent overflow */
+    if (next != can_rx_tail)
+    {
+        can_rx_buffer[can_rx_head] = *frame;
+        can_rx_head = next;
+    }
+}
+
+
+/**
+ * @brief Frames available in RX buffer
+ */
+uint16_t drv_cb_can_frames_available(void)
+{
+    if (can_rx_head >= can_rx_tail)
+    {
+        return can_rx_head - can_rx_tail;
+    }
+
+    return CAN_RX_BUFFER_SIZE - can_rx_tail + can_rx_head;
 }
 
 #endif

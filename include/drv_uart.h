@@ -29,22 +29,36 @@ along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
 
 /**
  * @file drv_uart.h
+ * @author
  * @brief Generic UART driver abstraction interface
+ * @version 1.0
+ * @date 2026
  *
- * This module provides a hardware independent UART interface used by
- * higher layers such as the transport layer or bootloader command parser.
+ * @details
+ * This module provides a hardware independent UART abstraction layer
+ * used by upper firmware layers such as:
  *
- * The actual UART hardware implementation is provided by the application
- * (typically in main.c or a HAL driver) and registered using
- * uart_driver_register().
+ * - Transport layer
+ * - Bootloader protocol
+ * - Command parser
  *
- * This allows the firmware to remain independent from the underlying
- * MCU UART implementation.
+ * The actual UART peripheral implementation is provided by the
+ * application (typically inside `main.c` or an MCU HAL driver).
  *
- * Example usage:
+ * The application must populate a @ref uart_ops_t structure with
+ * hardware specific functions and register it using
+ * @ref bl_uart_driver_register().
+ *
+ * This design allows the firmware to remain **portable across MCUs**
+ * while keeping hardware access separated from protocol logic.
+ *
+ * Typical workflow:
  *
  * @code
- * uart_ops_t ops =
+ * static int32_t mcu_uart_tx(const uint8_t *data, uint16_t len);
+ * static int32_t mcu_uart_rx(uint8_t *data, uint16_t len);
+ *
+ * uart_ops_t uart_ops =
  * {
  *     .init     = mcu_uart_init,
  *     .close    = mcu_uart_close,
@@ -52,57 +66,101 @@ along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
  *     .receive  = mcu_uart_rx
  * };
  *
- * uart_driver_register(&ops);
+ * int main(void)
+ * {
+ *     bl_uart_driver_register(&uart_ops);
  *
- * uart_init();
+ *     uart_init();
  *
- * uart_transmit(data, len);
+ *     uart_transmit(buffer, length);
+ * }
  * @endcode
  */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #include "bl_types.h"
+#include "reboot_config.h"
 
 /**
  * @defgroup UART_DRIVER UART Driver Abstraction
- * @brief Hardware independent UART driver interface
+ * @brief Hardware independent UART interface
  *
- * This module defines the UART abstraction used by the transport layer.
- * The real UART hardware driver must implement the operations defined
- * in uart_ops_t and register them using uart_driver_register().
+ * This module defines the UART abstraction used by the transport layer
+ * and bootloader communication stack.
+ *
+ * The actual hardware driver must implement the functions defined in
+ * @ref uart_ops_t and register them using @ref bl_uart_driver_register().
  *
  * @{
  */
 
+#if (BOOT_INTERFACE == BL_INTERFACE_UART)
+/**
+ * @brief UART data source type
+ *
+ * Defines the origin of received UART data.
+ */
+typedef enum
+{
+    UART_PERIPHERAL = 0,   /**< Data received directly from UART peripheral */
+    UART_BUFFER           /**< Data retrieved from internal driver buffer */
+} uart_data_src_t;
+
 
 /**
- * @brief UART operations abstraction
+ * @brief UART RX byte callback prototype
+ *
+ * Callback used to notify upper layers when a single byte is received.
+ *
+ * @param byte Received byte
+ */
+typedef void (*drv_rx_byte_cb_t)(uint8_t byte);
+
+
+/**
+ * @brief UART RX data callback prototype
+ *
+ * Callback used when a block of data is received.
+ *
+ * @param data Pointer to received data buffer
+ * @param len  Number of received bytes
+ */
+typedef void (*drv_rx_data_cb_t)(uint8_t *data, uint16_t len);
+
+
+/**
+ * @brief UART operations abstraction structure
  *
  * This structure contains function pointers to the
  * hardware-specific UART implementation.
  *
- * The application must populate this structure and
- * register it using uart_driver_register().
+ * The application must populate this structure and register it
+ * using @ref bl_uart_driver_register().
+ *
+ * @note
+ * All functions must be implemented by the platform layer.
  */
 typedef struct
 {
     /**
      * @brief Initialize UART hardware
      *
-     * This function initializes the UART peripheral and prepares
-     * it for communication.
+     * Configures the UART peripheral and prepares it
+     * for communication.
      */
     void (*init)(void);
 
+
     /**
-     * @brief Close UART driver
+     * @brief Deinitialize UART hardware
      *
-     * This function deinitializes the UART peripheral and
-     * releases any allocated resources.
+     * Releases UART resources and disables the peripheral.
      */
     void (*close)(void);
+
 
     /**
      * @brief Transmit data over UART
@@ -110,18 +168,25 @@ typedef struct
      * @param data Pointer to transmit buffer
      * @param len  Number of bytes to transmit
      *
-     * @return Number of bytes transmitted
+     * @return
+     *  - Number of bytes transmitted
+     *  - Negative value on error
      */
     int32_t (*transmit)(const uint8_t *data,
                         uint16_t len);
 
+
     /**
      * @brief Receive data from UART
      *
-     * @param data Pointer to receive buffer
+     * Reads data from the UART peripheral or internal driver buffer.
+     *
+     * @param data   Pointer to receive buffer
      * @param maxlen Maximum number of bytes to read
      *
-     * @return Number of bytes received
+     * @return
+     *  - Number of bytes received
+     *  - Negative value on error
      */
     int32_t (*receive)(uint8_t *data,
                        uint16_t maxlen);
@@ -130,28 +195,27 @@ typedef struct
 
 
 /**
- * @brief Register UART driver operations
+ * @brief Register UART driver implementation
  *
- * This function registers the UART hardware implementation
- * with the abstraction layer.
- *
- * The provided operations will be used by the UART wrapper APIs.
+ * Registers the hardware specific UART operations with the
+ * abstraction layer.
  *
  * @param ops Pointer to UART operations structure
  *
- * @return None
+ * @note
+ * This function must be called before using any UART API.
  */
-void uart_driver_register(const uart_ops_t *ops);
+void bl_uart_driver_register(const uart_ops_t *ops);
 
 
 /**
  * @brief Initialize UART driver
  *
- * Calls the registered UART init function.
+ * Calls the registered hardware initialization function.
  *
  * @return
- *  - 0 : Success
- *  - negative value : Error
+ *  - 0 on success
+ *  - Negative value on failure
  */
 int32_t uart_init(void);
 
@@ -159,7 +223,7 @@ int32_t uart_init(void);
 /**
  * @brief Close UART driver
  *
- * Calls the registered UART close function.
+ * Calls the registered hardware close function.
  */
 void uart_close(void);
 
@@ -170,11 +234,11 @@ void uart_close(void);
  * Sends raw data through the registered UART driver.
  *
  * @param data Pointer to transmit buffer
- * @param len Number of bytes to transmit
+ * @param len  Number of bytes to transmit
  *
  * @return
  *  - Number of bytes transmitted
- *  - negative value on error
+ *  - Negative value on error
  */
 int uart_transmit(const uint8_t *data,
                   uint16_t len);
@@ -183,22 +247,43 @@ int uart_transmit(const uint8_t *data,
 /**
  * @brief Receive data using UART
  *
- * Reads data from the registered UART driver.
+ * Reads raw data from the UART driver.
  *
- * @param data Pointer to receive buffer
- * @param maxlen Maximum bytes to receive
+ * @param data   Pointer to receive buffer
+ * @param maxlen Maximum number of bytes to receive
  *
  * @return
  *  - Number of bytes received
- *  - negative value on error
+ *  - Negative value on error
  */
 int uart_receive(uint8_t *data,
-                 uint16_t maxlen);
+                 uint16_t maxlen,
+                 uart_data_src_t source);
 
 
 /**
- * @}
+ * @brief UART RX byte handler
+ *
+ * This function is typically called from a UART RX interrupt
+ * service routine (ISR). It stores the received byte into the
+ * internal UART ring buffer.
+ *
+ * @param byte Received byte
  */
+void drv_cb_uart_rx_byte(uint8_t byte);
+
+
+/**
+ * @brief Get number of bytes available in UART RX buffer
+ *
+ * @return Number of unread bytes in the UART buffer
+ */
+uint16_t drv_cb_uart_bytes_available(void);
+
+
+/** @} */ /* end of UART_DRIVER group */
+
+#endif
 
 #ifdef __cplusplus
 }

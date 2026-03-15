@@ -36,7 +36,7 @@ along with Re-BOOT. If not, see <https://www.gnu.org/licenses/>.
 #include "transport.h"
 
 #include "bl_protocol_config.h"
-
+#include "reboot_config.h"
 
 
 

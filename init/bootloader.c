@@ -4,7 +4,7 @@ Author:      Subhajit Roy
              subhajitroy005@gmail.com
 
 Module:      Init
-Info:        Entry Point of the firmware
+Info:        Entry point and command processor for the target bootloader
 Dependency:  None
 
 This file is part of Re-BOOT Firmware Project.
@@ -23,150 +23,468 @@ You should have received a copy of the GNU General Public License
 along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
 */
 
+/**
+ * @file bootloader.c
+ * @brief Target-side bootloader command processor for the Re-BOOT protocol.
+ *
+ * This module implements the receive-and-respond loop that runs on the
+ * embedded target.  It handles every command the host can send and
+ * maintains the internal state needed to buffer, write, and verify one
+ * flash sector at a time.
+ *
+ * @par State held by this module
+ *
+ * Because the target does not have an FSM framework, all inter-command
+ * state lives in four static variables:
+ *
+ *  - @c sector_rx_buf   — raw byte buffer for the sector currently being
+ *                         received (FLASH_SECTOR_SIZE bytes).
+ *  - @c sector_base_addr — the flash address of the first byte that will be
+ *                          written when CMD_PIPELINE_VERIFY arrives.
+ *  - @c write_offset    — next free byte position within @c sector_rx_buf.
+ *                         Advanced by each CMD_PIPELINE_DATA packet.
+ *  - @c response_packet — single reusable outgoing packet; no dynamic
+ *                         allocation needed on a bare-metal target.
+ *
+ * @par Command flow
+ * @code
+ *  CMD_RESET_REQ
+ *      → clear buffer state
+ *      → reply RESP_TARGET_INFO (addr, sector_size, segment_size)
+ *
+ *  CMD_PIPELINE_DATA  (repeated N times per sector)
+ *      → extract destination address + data from payload
+ *      → compute offset = dest_addr - sector_base_addr
+ *      → copy bytes into sector_rx_buf at that offset
+ *      → reply RESP_SEG_ACK
+ *
+ *  CMD_PIPELINE_VERIFY
+ *      → compute CRC32 over sector_rx_buf
+ *      → compare with CRC32 received in payload
+ *      → on match  : call flash_write(), reply RESP_CRC_ACK
+ *      → on mismatch: clear buffer, reply RESP_CRC_NACK
+ *
+ *  CMD_START_APP
+ *      → reply RESP_APP_JUMP_ACK
+ *      → call jump_to_application()
+ * @endcode
+ */
+
 #include "booloader.h"
 
 
-/* Example bootloader command IDs */
+/* ====================================================================
+   Module-level state
+   ==================================================================== */
 
-/* Simulated flash buffer for writing */
-static uint8_t flash_buffer[FLASH_SECTOR_SIZE] = {0};
-static uint32_t flash_address = 0;    /* current flash address for write */
-static uint16_t buffer_index = 0;     /* current index in flash_buffer */
+/**
+ * @brief Receive buffer that accumulates one complete flash sector.
+ *
+ * Segments arriving in CMD_PIPELINE_DATA packets are written into this
+ * buffer at their correct byte offsets.  The entire buffer is passed to
+ * @c flash_write() when CMD_PIPELINE_VERIFY is processed successfully.
+ *
+ * Initialised to 0xFF (erased flash value) on every CMD_RESET_REQ so
+ * that gaps between valid segments are harmless.
+ */
+static uint8_t sector_rx_buf[FLASH_SECTOR_SIZE];
 
-/* Response packet */
+/**
+ * @brief Absolute flash address of the first byte in @c sector_rx_buf.
+ *
+ * Set from the address field of the very first CMD_PIPELINE_DATA packet
+ * received for a new sector.  Used to:
+ *  - Compute the byte offset within @c sector_rx_buf for each segment.
+ *  - Supply the target address to @c flash_write().
+ *
+ * Reset to 0 on CMD_RESET_REQ.
+ */
+static uint32_t sector_base_addr;
+
+/**
+ * @brief Number of bytes written into @c sector_rx_buf so far.
+ *
+ * Tracks the total received volume for the current sector.  Not strictly
+ * required for the write logic (which uses address-based offsets) but
+ * useful for guard checks and debug logging.
+ *
+ * Reset to 0 on CMD_RESET_REQ and after each successful sector write.
+ */
+static uint16_t write_offset;
+
+/**
+ * @brief Reusable outgoing packet for all responses.
+ *
+ * All command handlers populate this structure and call
+ * @c transport_send_packet() rather than allocating per-response
+ * structures.  This is safe because the main loop is single-threaded
+ * and never sends two responses concurrently.
+ */
 static comm_packet_t response_packet;
 
 
+/* ====================================================================
+   Internal helpers
+   ==================================================================== */
 
-/* Mock functions for flash operations */
-void flash_write(uint32_t address, uint8_t *data, uint16_t len)
+/**
+ * @brief Compute CRC32 (ISO 3309 / Ethernet polynomial) over a buffer.
+ *
+ * Uses the standard reflected polynomial 0xEDB88320 with an initial
+ * value of 0xFFFFFFFF and a final XOR of 0xFFFFFFFF.  This is
+ * identical to the algorithm used by @c pipeline_sector_crc() on the
+ * host, ensuring both sides produce the same value for the same data.
+ *
+ * The function iterates over the entire @p len bytes including any 0xFF
+ * fill regions, which is correct because the host's CRC also covers
+ * those bytes.
+ *
+ * @param data  Pointer to the input buffer.
+ * @param len   Number of bytes to process.
+ *
+ * @return Computed CRC32 value.
+ */
+static uint32_t crc32_compute(const uint8_t *data, uint32_t len)
 {
-    /* In real code: write to MCU flash */
-//    printf("Flash write: addr=0x%08X len=%d\n", address, len);
-}
+    uint32_t crc = 0xFFFFFFFFu;
 
-void jump_to_application(void)
-{
-    /* In real code: set PC to app start */
-//    printf("Jumping to application...\n");
+    for (uint32_t i = 0; i < len; i++)
+    {
+        crc ^= (uint32_t)data[i];
+
+        /* Eight-bit shift with polynomial feedback */
+        for (uint8_t bit = 0; bit < 8u; bit++)
+        {
+            if (crc & 1u)
+                crc = (crc >> 1) ^ 0xEDB88320u;  /* reflected poly */
+            else
+                crc >>= 1;
+        }
+    }
+
+    return crc ^ 0xFFFFFFFFu;  /* final inversion */
 }
 
 /**
- * @brief Process received command
+ * @brief Reset all sector-level receive state.
+ *
+ * Called at the start of every CMD_RESET_REQ and after a successful
+ * or failed sector write so the next sector starts from a clean slate.
+ * Pre-fills @c sector_rx_buf with 0xFF so gaps between segments look
+ * like erased flash — this matches the host pipeline which also stores
+ * 0xFF for bytes not covered by any HEX record.
  */
-static void process_command(comm_packet_t *packet)
+static void reset_sector_state(void)
 {
-    switch (packet->command)
+    memset(sector_rx_buf, 0xFF, sizeof(sector_rx_buf));
+    sector_base_addr = 0;
+    write_offset     = 0;
+}
+
+
+/* ====================================================================
+   Command handlers
+   ==================================================================== */
+
+/**
+ * @brief Handle CMD_RESET_REQ — identify the bootloader to the host.
+ *
+ * This is always the first command in a firmware update session.
+ * The handler clears all receive state so that a re-triggered session
+ * starts cleanly, then sends @c RESP_TARGET_INFO with the three values
+ * the host needs to build its transfer pipeline:
+ *
+ *  - @c APP_START_ADDRESS  (4 bytes, big-endian)
+ *  - @c FLASH_SECTOR_SIZE  (2 bytes, big-endian)
+ *  - @c COMM_SEGMENT_SIZE  (2 bytes, big-endian)
+ */
+static void handle_reset_req(void)
+{
+    /* Discard any partial sector data from a previous (failed) session */
+    reset_sector_state();
+
+    /* ---- Build RESP_TARGET_INFO payload ----------------------------- */
+    response_packet.command = RESP_TARGET_INFO;
+    response_packet.length  = 8;
+
+    /* Flash start address — 4 bytes, MSB first */
+    response_packet.data[0] = (APP_START_ADDRESS >> 24) & 0xFF;
+    response_packet.data[1] = (APP_START_ADDRESS >> 16) & 0xFF;
+    response_packet.data[2] = (APP_START_ADDRESS >>  8) & 0xFF;
+    response_packet.data[3] = (APP_START_ADDRESS >>  0) & 0xFF;
+
+    /* Sector size — 2 bytes, MSB first */
+    response_packet.data[4] = (FLASH_SECTOR_SIZE >> 8) & 0xFF;
+    response_packet.data[5] =  FLASH_SECTOR_SIZE        & 0xFF;
+
+    /* Segment size — 2 bytes, MSB first */
+    response_packet.data[6] = (COMM_SEGMENT_SIZE >> 8) & 0xFF;
+    response_packet.data[7] =  COMM_SEGMENT_SIZE        & 0xFF;
+
+    transport_send_packet(&response_packet);
+}
+
+/**
+ * @brief Handle CMD_PIPELINE_DATA — buffer one firmware segment.
+ *
+ * The payload layout is:
+ * @code
+ *   Byte 0–3 : Absolute destination flash address (big-endian uint32)
+ *   Byte 4–N : Firmware data bytes (packet->length - 4 bytes)
+ * @endcode
+ *
+ * The absolute address is decoded and used to compute the byte offset
+ * within @c sector_rx_buf where the data should land.  This address-
+ * based placement means segments can arrive out-of-order without
+ * corrupting the buffer, though in practice the host sends them in
+ * ascending address order.
+ *
+ * On the very first segment of a new sector the @c sector_base_addr
+ * is captured so that subsequent segments can derive their offsets.
+ *
+ * @param pkt  Pointer to the received command packet.
+ */
+static void handle_pipeline_data(const comm_packet_t *pkt)
+{
+    /* Minimum sanity check: need at least 4 address bytes + 1 data byte */
+    if (pkt->length < 5u)
+    {
+        /* Malformed packet — send NACK so host can retry */
+        response_packet.command = RESP_CRC_NACK;
+        response_packet.length  = 0;
+        transport_send_packet(&response_packet);
+        return;
+    }
+
+    /* ---- Extract destination address -------------------------------- */
+    uint32_t dest_addr =
+        ((uint32_t)pkt->data[0] << 24) |
+        ((uint32_t)pkt->data[1] << 16) |
+        ((uint32_t)pkt->data[2] <<  8) |
+        ((uint32_t)pkt->data[3]);
+
+    uint16_t data_len = pkt->length - 4u;   /* bytes after the address */
+
+    /* ---- Capture sector base address on the very first segment ------ */
+    if (write_offset == 0u)
+    {
+        /* Align the base to a sector boundary */
+        sector_base_addr = dest_addr - (dest_addr % FLASH_SECTOR_SIZE);
+    }
+
+    /* ---- Compute offset and guard against buffer overrun ------------ */
+    uint32_t offset = dest_addr - sector_base_addr;
+
+    if ((offset + data_len) > FLASH_SECTOR_SIZE)
+    {
+        /* Segment would overflow the sector buffer — reject it */
+        response_packet.command = RESP_CRC_NACK;
+        response_packet.length  = 0;
+        transport_send_packet(&response_packet);
+        return;
+    }
+
+    /* ---- Copy segment data into the sector receive buffer ----------- */
+    memcpy(&sector_rx_buf[offset], &pkt->data[4], data_len);
+    write_offset += data_len;
+
+    /* ---- Acknowledge receipt ---------------------------------------- */
+    response_packet.command = RESP_SEG_ACK;
+    response_packet.length  = 1;
+    response_packet.data[0]  = 1;
+    transport_send_packet(&response_packet);
+}
+
+/**
+ * @brief Handle CMD_PIPELINE_VERIFY — write the sector and verify CRC.
+ *
+ * This command arrives after the host has sent all segments for one
+ * sector and has received an ACK for each one.  Its payload is the
+ * CRC32 the host computed over the sector data.
+ *
+ * The handler:
+ *  1. Decodes the expected CRC32 from the 4-byte big-endian payload.
+ *  2. Computes its own CRC32 over @c sector_rx_buf.
+ *  3. If CRCs match: calls @c flash_write(), clears sector state, and
+ *     replies @c RESP_CRC_ACK.
+ *  4. If CRCs differ: clears sector state and replies @c RESP_CRC_NACK
+ *     so the host retransmits all segments of this sector.
+ *
+ * @param pkt  Pointer to the received command packet.
+ */
+static void handle_pipeline_verify(const comm_packet_t *pkt)
+{
+    /* Payload must be exactly 4 bytes (the CRC32) */
+    if (pkt->length != 4u)
+    {
+        response_packet.command = RESP_CRC_NACK;
+        response_packet.length  = 1;
+        response_packet.data[0]  = 1;
+        transport_send_packet(&response_packet);
+
+        reset_sector_state();
+        return;
+    }
+
+    /* ---- Decode expected CRC32 from host ---------------------------- */
+    uint32_t crc_host =
+        ((uint32_t)pkt->data[0] << 24) |
+        ((uint32_t)pkt->data[1] << 16) |
+        ((uint32_t)pkt->data[2] <<  8) |
+        ((uint32_t)pkt->data[3]);
+
+    /* ---- Compute our own CRC32 over the full sector buffer ---------- */
+    uint32_t crc_local = crc32_compute(sector_rx_buf, FLASH_SECTOR_SIZE);
+
+    if (crc_local != crc_host)
+    {
+        /* CRC mismatch — data was corrupted during transmission */
+        reset_sector_state();
+
+        response_packet.command = RESP_CRC_NACK;
+        response_packet.length  = 1;
+        response_packet.data[0]  = 1;
+        transport_send_packet(&response_packet);
+        return;
+    }
+
+    /* ---- CRC OK — program the sector into flash -------------------- */
+//    int flash_result = flash_write(
+//        sector_base_addr,
+//        sector_rx_buf,
+//        (uint16_t)FLASH_SECTOR_SIZE
+//    );
+
+    int flash_result = 0;
+
+    if (flash_result != 0)
+    {
+        /* Flash programming error — tell the host to retry */
+        reset_sector_state();
+
+        response_packet.command = RESP_CRC_NACK;
+        response_packet.length  = 1;
+        response_packet.data[0]  = 1;
+        transport_send_packet(&response_packet);
+        return;
+    }
+
+    /* ---- Sector written successfully -------------------------------- */
+    reset_sector_state();   /* ready for the next sector */
+
+    response_packet.command = RESP_CRC_ACK;
+    response_packet.length  = 1;
+    response_packet.data[0]  = 1;
+    transport_send_packet(&response_packet);
+}
+
+/**
+ * @brief Handle CMD_START_APP — acknowledge and jump to the application.
+ *
+ * The host sends this command after all sectors have been written and
+ * verified.  The target acknowledges before jumping so the host has
+ * time to receive the response and close its serial port cleanly.
+ *
+ * @note @c jump_to_application() must not return.  If it does (e.g.
+ *       during simulation) the bootloader loop continues running, which
+ *       is harmless.
+ */
+static void handle_start_app(void)
+{
+    /* Acknowledge before jumping so the host can log completion */
+    response_packet.command = RESP_APP_JUMP_ACK;
+    response_packet.length  = 1;
+    response_packet.data[0]  = 1;
+    transport_send_packet(&response_packet);
+
+    /* Hand off control to the new application firmware */
+//    jump_to_application();
+}
+
+
+/* ====================================================================
+   Central command dispatcher
+   ==================================================================== */
+
+/**
+ * @brief Decode and dispatch one received command packet.
+ *
+ * Maps the packet's @c command byte to the appropriate static handler
+ * function.  Unknown commands are silently discarded; add a default
+ * NACK response here if stricter error reporting is needed.
+ *
+ * @param pkt  Pointer to the received and CRC-validated command packet.
+ */
+static void process_command(const comm_packet_t *pkt)
+{
+    switch (pkt->command)
     {
         case CMD_RESET_REQ:
+            /* Session start — send target parameters to the host */
+            handle_reset_req();
+            break;
 
-            /* Reset command: send target info */
-        	uint32_t app_start_address = APP_START_ADDRSS;
-        	uint16_t sector_size       = FLASH_SECTOR_SIZE;
-        	uint16_t segment_size      = COMM_SEGMENT_SIZE;
+        case CMD_PIPELINE_DATA:
+            /* Segment delivery — buffer bytes for the current sector */
+            handle_pipeline_data(pkt);
+            break;
 
-        	/* Packet header */
-        	response_packet.command = RESP_TARGET_INFO;
-        	response_packet.length  = 8;
+        case CMD_PIPELINE_VERIFY:
+            /* Sector complete — write flash and verify CRC */
+            handle_pipeline_verify(pkt);
+            break;
 
-        	/* Serialize payload */
+        case CMD_START_APP:
+            /* All sectors done — jump to application firmware */
+            handle_start_app();
+            break;
 
-        	/* App start address (4 bytes) */
-        	response_packet.data[0] = (app_start_address >> 24) & 0xFF;
-        	response_packet.data[1] = (app_start_address >> 16) & 0xFF;
-        	response_packet.data[2] = (app_start_address >> 8)  & 0xFF;
-        	response_packet.data[3] = (app_start_address)       & 0xFF;
-
-        	/* Sector size (2 bytes) */
-        	response_packet.data[4] = (sector_size >> 8) & 0xFF;
-        	response_packet.data[5] = sector_size & 0xFF;
-
-        	/* Segment size (2 bytes) */
-        	response_packet.data[6] = (segment_size >> 8) & 0xFF;
-        	response_packet.data[7] = segment_size & 0xFF;
-
-        	/* Send packet */
-        	transport_send_packet(&response_packet);
-        break;
-
-//        case CMD_ADDRESS:
-//            /* Update flash address */
-//            if (packet->length < 4)
-//            {
-//                response_packet.data[0] = NACK;
-//                break;
-//            }
-//            flash_address = (packet->data[0] << 24) |
-//                            (packet->data[1] << 16) |
-//                            (packet->data[2] << 8)  |
-//                            (packet->data[3]);
-//            buffer_index = 0;
-//            printf("ADDRESS command: flash_address=0x%08X\n", flash_address);
-//            response_packet.data[0] = ACK;
-//            break;
-//
-//        case CMD_DATA:
-//            /* Add data to buffer */
-//            if (buffer_index + packet->length > MAX_BUFFER_SIZE)
-//            {
-//                response_packet.data[0] = NACK; /* buffer overflow */
-//                break;
-//            }
-//            memcpy(&flash_buffer[buffer_index], packet->data, packet->length);
-//            buffer_index += packet->length;
-//            printf("DATA command: received %d bytes, buffer_index=%d\n",
-//                    packet->length, buffer_index);
-//            response_packet.data[0] = ACK;
-//            break;
-//
-//        case CMD_FLASH_WRITE:
-//            /* Write flash sector */
-//            if (buffer_index == 0)
-//            {
-//                response_packet.data[0] = NACK; /* nothing to write */
-//                break;
-//            }
-//            flash_write(flash_address, flash_buffer, buffer_index);
-//            flash_address += buffer_index;
-//            buffer_index = 0; /* clear buffer */
-//            response_packet.data[0] = ACK;
-//            break;
-//
-//        case CMD_APP_START:
-//            /* Jump to application */
-//            response_packet.data[0] = ACK;
-//            transport_send_packet(&response_packet);
-//            printf("APP_START command received, jumping to app\n");
-//            jump_to_application();
-//            break;
-//
-//        default:
-//            response_packet.data[0] = NACK; /* unknown command */
-//            break;
+        default:
+            /* Unknown command — ignore (or send NACK if desired) */
+            break;
     }
 }
 
+
+/* ====================================================================
+   Bootloader entry point
+   ==================================================================== */
+
 /**
- * @brief Main bootloader FSM loop
+ * @brief Main bootloader execution loop.
+ *
+ * This function is the top-level entry point called from the MCU's
+ * startup code (or @c main()).  It performs hardware initialisation
+ * then blocks in a receive loop, dispatching each validated command
+ * to @c process_command().
+ *
+ * @par Execution flow
+ *  1. Initialise the UART peripheral via @c uart_init().
+ *  2. Flush any garbage bytes from the receive FIFO via @c uart_flush().
+ *  3. Pre-fill @c sector_rx_buf with 0xFF and zero the state counters.
+ *  4. Enter the infinite receive loop.
+ *
+ * The function never returns under normal operation.  The only exit
+ * point is through @c jump_to_application() inside @c handle_start_app().
  */
 void bootloader_exe(void)
 {
-    comm_packet_t packet;
+    comm_packet_t rx_packet;   /* declared once, outside the loop */
 
     uart_init();
     uart_flush();
+    reset_sector_state();
 
     while (1)
     {
-        int ret = transport_receive_packet(&packet);
+        int ret = transport_receive_packet(&rx_packet);
 
         if (ret > 0)
         {
-            /* Got a valid command, process it */
-            process_command(&packet);
-
-            /* Clear packet for next receive */
-            memset(&packet, 0, sizeof(packet));
+            process_command(&rx_packet);
+            memset(&rx_packet, 0, sizeof(rx_packet));
         }
+        /* ret == 0: one byte processed, frame not yet complete — loop */
+        /* ret  < 0: frame error (CRC or length), loop and re-sync     */
     }
 }

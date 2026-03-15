@@ -36,6 +36,8 @@ static uint16_t buffer_index = 0;     /* current index in flash_buffer */
 /* Response packet */
 static comm_packet_t response_packet;
 
+
+
 /* Mock functions for flash operations */
 void flash_write(uint32_t address, uint8_t *data, uint16_t len)
 {
@@ -54,16 +56,37 @@ void jump_to_application(void)
  */
 static void process_command(comm_packet_t *packet)
 {
-    response_packet.command = packet->command;
-    response_packet.length  = 1; /* default 1 byte ACK/NACK */
-
     switch (packet->command)
     {
         case CMD_RESET_REQ:
+
             /* Reset command: send target info */
-//            printf("RESET command received\n");
-            response_packet.data[0] = 0;
-            /* Example: send MCU/bootloader version or ID if needed */
+        	uint32_t app_start_address = APP_START_ADDRSS;
+        	uint16_t sector_size       = FLASH_SECTOR_SIZE;
+        	uint16_t segment_size      = COMM_SEGMENT_SIZE;
+
+        	/* Packet header */
+        	response_packet.command = RESP_TARGET_INFO;
+        	response_packet.length  = 8;
+
+        	/* Serialize payload */
+
+        	/* App start address (4 bytes) */
+        	response_packet.data[0] = (app_start_address >> 24) & 0xFF;
+        	response_packet.data[1] = (app_start_address >> 16) & 0xFF;
+        	response_packet.data[2] = (app_start_address >> 8)  & 0xFF;
+        	response_packet.data[3] = (app_start_address)       & 0xFF;
+
+        	/* Sector size (2 bytes) */
+        	response_packet.data[4] = (sector_size >> 8) & 0xFF;
+        	response_packet.data[5] = sector_size & 0xFF;
+
+        	/* Segment size (2 bytes) */
+        	response_packet.data[6] = (segment_size >> 8) & 0xFF;
+        	response_packet.data[7] = segment_size & 0xFF;
+
+        	/* Send packet */
+        	transport_send_packet(&response_packet);
         break;
 
 //        case CMD_ADDRESS:
@@ -121,12 +144,6 @@ static void process_command(comm_packet_t *packet)
 //            response_packet.data[0] = NACK; /* unknown command */
 //            break;
     }
-
-    /* Send ACK/NACK for all except APP_START (already sent) */
-    if (packet->command != 0)
-    {
-        transport_send_packet(&response_packet);
-    }
 }
 
 /**
@@ -137,7 +154,7 @@ void bootloader_exe(void)
     comm_packet_t packet;
 
     uart_init();
-
+    uart_flush();
 
     while (1)
     {

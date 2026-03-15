@@ -41,243 +41,216 @@ along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
 #include "transport.h"
 #include <string.h>
 
+
+
+static uint16_t crc16_ccitt(const uint8_t *data, uint16_t len)
+{
+    uint16_t crc = 0xFFFF;
+
+    for (uint16_t i = 0; i < len; i++)
+    {
+        crc ^= (uint16_t)data[i] << 8;
+
+        for (uint8_t j = 0; j < 8; j++)
+        {
+            if (crc & 0x8000)
+                crc = (crc << 1) ^ 0x1021;
+            else
+                crc <<= 1;
+        }
+    }
+
+    return crc;
+}
+
+
 #if (BOOT_INTERFACE == BL_INTERFACE_UART)
+
 #include "drv_uart.h"
 
-/**
- * @brief UART RX parser state
- */
+/* RX parser state */
 typedef struct
 {
-    uint8_t buffer[COMM_MAX_DATA + 5]; /**< Buffer to store incoming UART frame */
-    uint16_t index;                    /**< Current write index */
-} uart_rx_state_t;
+    uint8_t  buffer[COMM_MAX_DATA + 6];
+    uint16_t index;
+    uint16_t expected_length;
+} uart_parser_t;
 
-/** @brief UART RX parser instance */
-static uart_rx_state_t uart_state = {0};
+static uart_parser_t parser;;
 
-/**
- * @brief Parse UART byte stream into comm_packet_t
- *
- * UART frame format: [:][cmd 1B][len 2B][data N][#]
- *
- * @param[out] packet Pointer to comm_packet_t to store parsed frame
- * @return
- *  - >0 : Number of data bytes received
- *  - 0  : No complete frame yet
- *  - <0 : Error code
- *         -1 : Null packet pointer
- *         -2 : Frame too short
- *         -3 : Invalid length
- */
-int uart_receive_packet(comm_packet_t *packet)
+
+int transport_receive_packet(comm_packet_t *packet)
 {
-    if (!packet) return -1;
+    if (!packet)
+        return -1;
 
     uint8_t byte;
 
     while (uart_receive(&byte, 1, UART_BUFFER) == 1)
     {
         /* Wait for start byte */
-        if (uart_state.index == 0 && byte != ':') continue;
-
-        if (uart_state.index >= sizeof(uart_state.buffer))
+        if (parser.index == 0)
         {
-            uart_state.index = 0; /* buffer overflow, reset */
+            if (byte != ':')
+                continue;
+
+            parser.buffer[parser.index++] = byte;
+            continue;
         }
 
-        uart_state.buffer[uart_state.index++] = byte;
+        parser.buffer[parser.index++] = byte;
 
-        /* Check frame terminator */
-        if (byte == '#')
+        /* overflow protection */
+        if (parser.index >= sizeof(parser.buffer))
         {
-            if (uart_state.index < 5) /* : + cmd + len_hi + len_lo + # */
+            parser.index = 0;
+            parser.expected_length = 0;
+            continue;
+        }
+
+        /* read length */
+        if (parser.index == 4)
+        {
+            parser.expected_length =
+                ((uint16_t)parser.buffer[2] << 8) |
+                 parser.buffer[3];
+
+            /* invalid length → resync */
+            if (parser.expected_length > COMM_MAX_DATA)
             {
-                uart_state.index = 0;
-                return -2;
+                parser.index = 0;
+                parser.expected_length = 0;
+                continue;
             }
+        }
 
-            packet->command = uart_state.buffer[1];
-            packet->length  = (uart_state.buffer[2] << 8) | uart_state.buffer[3];
+        /* complete frame */
+        if (parser.index == parser.expected_length + 6)
+        {
+            packet->command = parser.buffer[1];
+            packet->length  = parser.expected_length;
 
-            if (packet->length > COMM_MAX_DATA || packet->length != uart_state.index - 5)
-            {
-                uart_state.index = 0;
-                return -3;
-            }
+            memcpy(packet->data,
+                   &parser.buffer[4],
+                   packet->length);
 
-            memcpy(packet->data, &uart_state.buffer[4], packet->length);
-            uart_state.index = 0;
+            uint16_t crc_rx =
+                ((uint16_t)parser.buffer[4 + packet->length] << 8) |
+                 parser.buffer[5 + packet->length];
+
+            uint16_t crc_calc =
+                crc16_ccitt(&parser.buffer[1], packet->length + 3);
+
+            parser.index = 0;
+            parser.expected_length = 0;
+
+            if (crc_rx != crc_calc)
+                continue;
+
             return packet->length;
         }
     }
 
-    return 0; /* incomplete frame */
-}
-
-/**
- * @brief Send comm_packet_t over UART
- *
- * UART frame format: [:][cmd 1B][len 2B][data N][#]
- *
- * @param[in] packet Pointer to comm_packet_t to send
- * @return
- *  - Number of bytes transmitted
- *  - <0 : Error
- */
-int uart_send_packet(const comm_packet_t *packet)
-{
-    if (!packet || packet->length > COMM_MAX_DATA) return -1;
-
-    uint8_t buffer[COMM_MAX_DATA + 5]; /* : + cmd + len_hi + len_lo + data + # */
-
-    buffer[0] = ':';
-    buffer[1] = (uint8_t)(packet->command & 0xFF);
-    buffer[2] = (uint8_t)((packet->length >> 8) & 0xFF);
-    buffer[3] = (uint8_t)(packet->length & 0xFF);
-    memcpy(&buffer[4], packet->data, packet->length);
-    buffer[4 + packet->length] = '#';
-
-    return uart_transmit(buffer, 5 + packet->length);
-}
-
-#endif /* BL_INTERFACE_UART */
-
-#if (BOOT_INTERFACE == BL_INTERFACE_CAN)
-#include "drv_can.h"
-
-/**
- * @brief Convert CAN frame to comm_packet_t
- *
- * CAN frame format: [cmd 1B][len 2B][data N][#]
- *
- * @param[in] frame Pointer to received CAN frame
- * @param[out] packet Pointer to comm_packet_t to store parsed frame
- * @return
- *  - Number of data bytes copied
- *  - <0 : Error
- */
-int can_frame_to_packet(const can_frame_t *frame, comm_packet_t *packet)
-{
-    if (!frame || !packet || frame->len < 4) return -1;
-
-    packet->command = frame->data[0];
-    packet->length  = (frame->data[1] << 8) | frame->data[2];
-
-    if (packet->length > COMM_MAX_DATA || packet->length != frame->len - 4) return -2;
-
-    memcpy(packet->data, &frame->data[3], packet->length);
-    return packet->length;
-}
-
-/**
- * @brief Convert comm_packet_t to CAN frame
- *
- * @param[in] packet Pointer to comm_packet_t to send
- * @param[out] frame Pointer to CAN frame to populate
- * @param[in] id CAN identifier
- * @return 0 on success, <0 on error
- */
-int packet_to_can_frame(const comm_packet_t *packet, can_frame_t *frame, uint32_t id)
-{
-    if (!packet || !frame || packet->length > 5) return -1;
-
-    frame->id  = id;
-    frame->len = 3 + packet->length + 1; /* cmd+len+data+# */
-
-    frame->data[0] = (uint8_t)(packet->command & 0xFF);
-    frame->data[1] = (uint8_t)((packet->length >> 8) & 0xFF);
-    frame->data[2] = (uint8_t)(packet->length & 0xFF);
-
-    memcpy(&frame->data[3], packet->data, packet->length);
-    frame->data[3 + packet->length] = '#';
-
     return 0;
 }
 
-/**
- * @brief Send comm_packet_t over CAN
- *
- * @param[in] packet Pointer to comm_packet_t to send
- * @param[in] id CAN identifier
- * @return Number of bytes transmitted or <0 on error
- */
-int can_send_packet(const comm_packet_t *packet, uint32_t id)
-{
-    can_frame_t frame;
-    if (packet_to_can_frame(packet, &frame, id) != 0) return -1;
 
-    return can_transmit(frame.id, frame.data, frame.len);
-}
-
-/**
- * @brief Receive comm_packet_t from CAN buffer
- *
- * @param[out] packet Pointer to comm_packet_t to store received frame
- * @return Number of bytes received or <0 on error
- */
-int can_receive_packet(comm_packet_t *packet)
-{
-    can_frame_t frame;
-    int ret = can_receive(&frame, CAN_BUFFER);
-    if (ret <= 0) return ret;
-
-    return can_frame_to_packet(&frame, packet);
-}
-
-#endif /* BL_INTERFACE_CAN */
-
-/**
- * @brief Receive a comm_packet_t from selected transport interface
- *
- * @param[out] packet Pointer to store received packet
- * @return Number of bytes received, 0 if incomplete, <0 on error
- */
-int transport_receive_packet(comm_packet_t *packet)
-{
-#if (BOOT_INTERFACE == BL_INTERFACE_UART)
-    return uart_receive_packet(packet);
-
-#elif (BOOT_INTERFACE == BL_INTERFACE_CAN)
-    return can_receive_packet(packet);
-
-#elif (BOOT_INTERFACE == BL_INTERFACE_TCP)
-    uint8_t buffer[sizeof(comm_packet_t)];
-    int len = tcp_receive(buffer, sizeof(buffer));
-    if (len <= 0) return -1;
-
-    if (len < sizeof(uint32_t) + sizeof(uint16_t)) return -2;
-
-    memcpy(packet, buffer, sizeof(comm_packet_t));
-    return packet->length;
-
-#else
-#error "Invalid BOOT_INTERFACE"
-#endif
-}
-
-/**
- * @brief Send a comm_packet_t via selected transport interface
- *
- * @param[in] packet Pointer to comm_packet_t to send
- * @return Number of bytes sent or <0 on error
- */
 int transport_send_packet(comm_packet_t *packet)
 {
-#if (BOOT_INTERFACE == BL_INTERFACE_UART)
-    return uart_send_packet(packet);
+    if (!packet || packet->length > COMM_MAX_DATA)
+        return -1;
 
-#elif (BOOT_INTERFACE == BL_INTERFACE_CAN)
-    uint32_t id = 0x123; /* default CAN ID */
-    return can_send_packet(packet, id);
+    uint8_t buffer[COMM_MAX_DATA + 6];
 
-#elif (BOOT_INTERFACE == BL_INTERFACE_TCP)
-    uint16_t total = sizeof(packet->command) + sizeof(packet->length) + packet->length;
-    uint8_t buffer[sizeof(comm_packet_t)];
-    memcpy(buffer, packet, total);
-    return tcp_transmit(buffer, total);
+    buffer[0] = ':';
+    buffer[1] = packet->command;
+    buffer[2] = (packet->length >> 8) & 0xFF;
+    buffer[3] = packet->length & 0xFF;
 
-#else
-#error "Invalid BOOT_INTERFACE"
-#endif
+    memcpy(&buffer[4], packet->data, packet->length);
+
+    uint16_t crc = crc16_ccitt(&buffer[1], packet->length + 3);
+
+    buffer[4 + packet->length] = (crc >> 8) & 0xFF;
+    buffer[5 + packet->length] = crc & 0xFF;
+
+    return uart_transmit(buffer, packet->length + 6);
 }
+
+#endif
+
+
+
+#if (BOOT_INTERFACE == BL_INTERFACE_CAN)
+
+#include "drv_can.h"
+
+int transport_receive_packet(comm_packet_t *packet)
+{
+    can_frame_t frame;
+
+    int ret = can_receive(&frame);
+    if (ret <= 0)
+        return ret;
+
+    if (frame.len < 5)
+        return -1;
+
+    packet->command = frame.data[0];
+    packet->length =
+        (frame.data[1] << 8) |
+         frame.data[2];
+
+    if (packet->length > COMM_MAX_DATA ||
+        packet->length != frame.len - 5)
+        return -2;
+
+    memcpy(packet->data,
+           &frame.data[3],
+           packet->length);
+
+    uint16_t crc_rx =
+        ((uint16_t)frame.data[3 + packet->length] << 8) |
+         frame.data[4 + packet->length];
+
+    uint16_t crc_calc =
+        crc16_ccitt(&frame.data[0], packet->length + 3);
+
+    if (crc_rx != crc_calc)
+        return -3;
+
+    return packet->length;
+}
+
+
+int transport_send_packet(comm_packet_t *packet)
+{
+    if (!packet || packet->length > 5)
+        return -1;
+
+    can_frame_t frame;
+
+    frame.id = 0x123;
+
+    frame.data[0] = packet->command;
+    frame.data[1] = (packet->length >> 8) & 0xFF;
+    frame.data[2] = packet->length & 0xFF;
+
+    memcpy(&frame.data[3],
+           packet->data,
+           packet->length);
+
+    uint16_t crc =
+        crc16_ccitt(&frame.data[0], packet->length + 3);
+
+    frame.data[3 + packet->length] = (crc >> 8) & 0xFF;
+    frame.data[4 + packet->length] = crc & 0xFF;
+
+    frame.len = packet->length + 5;
+
+    return can_transmit(frame.id,
+                        frame.data,
+                        frame.len);
+}
+
+#endif

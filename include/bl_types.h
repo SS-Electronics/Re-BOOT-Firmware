@@ -29,6 +29,7 @@ along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
 #include <stdint.h>
 #include <stddef.h>
 #include <inttypes.h>
+#include <stdlib.h>
 
 
 #define COMM_MAX_DATA 64
@@ -38,10 +39,9 @@ along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
  */
 typedef struct
 {
-    uint32_t command;              /**< Command identifier */
-    uint16_t length;               /**< Payload length */
-    uint8_t  data[COMM_MAX_DATA];  /**< Payload buffer */
-
+    uint8_t  command;
+    uint16_t length;
+    uint8_t  data[COMM_MAX_DATA];
 } comm_packet_t;
 
 

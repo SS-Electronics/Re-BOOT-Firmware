@@ -82,6 +82,15 @@ void uart_close(void)
     }
 }
 
+void uart_flush(void)
+{
+    uint8_t dummy;
+
+    while (uart_receive(&dummy, 1, UART_BUFFER) == 1)
+    {
+        /* discard */
+    }
+}
 
 /**
  * @brief UART transmit

@@ -228,6 +228,8 @@ int32_t uart_init(void);
 void uart_close(void);
 
 
+void uart_flush(void);
+
 /**
  * @brief Transmit data using UART
  *

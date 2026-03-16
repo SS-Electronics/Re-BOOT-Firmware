@@ -445,115 +445,126 @@ int transport_send_packet(comm_packet_t *packet)
 #include "drv_can.h"
 
 /**
- * @brief Receive one packet from the CAN bus.
+ * @brief Receive one Re-BOOT protocol packet from the CAN bus.
  *
- * Reads a single CAN frame via @c can_receive() and extracts the
- * Re-BOOT protocol packet from it.  The CAN frame payload layout is:
+ * Pops the oldest frame from the ISR ring buffer (filled by
+ * drv_cb_can_rx_frame() from the CAN RX interrupt) and maps it
+ * directly to a comm_packet_t using the CAN native fields:
+ *
  * @code
- *   Byte 0     : CMD
- *   Byte 1–2   : Payload length (big-endian)
- *   Byte 3..3+N-1 : DATA[0..N-1]
- *   Byte 3+N   : CRC_H
- *   Byte 4+N   : CRC_L
+ *  ┌────────────┬─────┬──────────────────┐
+ *  │  CAN_ID    │ DLC │  DATA[0..DLC-1]  │
+ *  └────────────┴─────┴──────────────────┘
+ *   = CMD          = length  = payload bytes
  * @endcode
  *
- * @param packet  Output: populated on success.
+ * No software CRC is performed.  CAN bus hardware provides a 15-bit
+ * hardware CRC on every frame; a corrupted frame is never delivered
+ * to the receive FIFO.
  *
- * @return Payload byte count on success.
- * @retval -1  @p packet is NULL, or CAN frame too short.
- * @retval -2  Payload length field invalid or inconsistent with frame.
- * @retval -3  CRC mismatch — frame discarded.
+ * @param packet  Output: populated on success.  Must not be NULL.
+ *
+ * @return Payload byte count (DLC) on success.
+ * @retval  0  Ring buffer empty — retry next tick.
+ * @retval -1  NULL packet, driver error, or DLC > COMM_MAX_DATA.
  */
 int transport_receive_packet(comm_packet_t *packet)
 {
-    can_frame_t frame;
-
-    int ret = can_receive(&frame);
-    if (ret <= 0)
-        return ret;
-
-    /* Minimum frame: CMD(1) + LEN(2) + CRC(2) = 5 bytes */
-    if (frame.len < 5)
+    if (!packet)
         return -1;
 
-    /* ---- Extract command and payload length ----------------------- */
-    packet->command = frame.data[0];
-    packet->length  = ((uint16_t)frame.data[1] << 8) |
-                       (uint16_t)frame.data[2];
+    can_frame_t frame;
 
-    /* Validate: length must fit in buffer and match frame byte count */
-    if (packet->length > (uint16_t)COMM_MAX_DATA ||
-        packet->length != (uint16_t)(frame.len - 5u))
-        return -2;
+    /* Pop one frame from the ISR-fed ring buffer */
+    int ret = can_receive(&frame, CAN_BUFFER);
 
-    /* ---- Copy payload -------------------------------------------- */
-    memcpy(packet->data, &frame.data[3], packet->length);
+    if (ret <= 0)
+    {
+        /* 0 = buffer empty, <0 = driver error — caller retries */
+        return ret;
+    }
 
-    /* ---- Verify CRC ---------------------------------------------- */
-    uint16_t crc_rx =
-        ((uint16_t)frame.data[3u + packet->length] << 8) |
-         (uint16_t)frame.data[4u + packet->length];
+    /* ---- Map CAN native fields to comm_packet_t ------------------- */
 
-    /* CRC covers CMD + LEN_H + LEN_L + DATA (same scope as UART) */
-    uint16_t crc_calc = crc16_ccitt(&frame.data[0],
-                                    (uint16_t)(packet->length + 3u));
+    /*
+     * CAN_ID  → command
+     * The CAN identifier carries the Re-BOOT command code directly.
+     * This eliminates the CMD byte from the data field and allows
+     * hardware acceptance filters to pass only bootloader frames.
+     */
+    packet->command = (uint8_t)(frame.id & 0xFFu);
 
-    if (crc_rx != crc_calc)
-        return -3;
+    /*
+     * DLC  → payload length
+     * DLC is always 0–8 for classic CAN, so no range check against
+     * a large COMM_MAX_DATA is strictly needed, but we guard anyway
+     * to be safe against a misconfigured driver returning DLC > 8.
+     */
+    if (frame.len > (uint8_t)COMM_MAX_DATA)
+        return -1;
+
+    packet->length = (uint16_t)frame.len;
+
+    /*
+     * data[0..DLC-1]  → payload bytes
+     * Raw bytes, no overhead, no CRC.  DLC = 0 is valid (command with
+     * no payload, e.g. CMD_RESET_REQ, CMD_START_APP).
+     */
+    if (packet->length > 0u)
+        memcpy(packet->data, frame.data, packet->length);
 
     return (int)packet->length;
 }
 
 
 /**
- * @brief Encode one packet into a CAN frame and transmit it.
+ * @brief Encode and transmit one Re-BOOT protocol packet over CAN.
  *
- * Packs the Re-BOOT protocol packet into the CAN frame payload:
+ * Maps the comm_packet_t directly onto CAN native fields:
+ *
  * @code
- *   Byte 0     : CMD
- *   Byte 1–2   : Payload length (big-endian)
- *   Byte 3..N  : DATA
- *   Byte 3+N   : CRC_H
- *   Byte 4+N   : CRC_L
+ *  ┌────────────┬─────┬──────────────────┐
+ *  │  CAN_ID    │ DLC │  DATA[0..DLC-1]  │
+ *  └────────────┴─────┴──────────────────┘
+ *   = CMD          = length  = payload bytes
  * @endcode
  *
- * @note CAN frames have an 8-byte DLC limit on standard CAN.  The
- *       maximum payload length over CAN is therefore 3 bytes (5 bytes
- *       of overhead + 3 bytes data = 8 bytes total).  The guard below
- *       enforces this.
+ * No software CRC bytes are appended.  CAN hardware generates and
+ * validates its own 15-bit CRC transparently.
  *
- * @param packet  Packet to transmit.  Must not be NULL.
+ * @note Maximum payload per frame is 8 bytes (classic CAN DLC limit).
  *
- * @return Number of CAN bytes transmitted on success, -1 on error.
+ * @param packet  Must not be NULL; payload must be 0–8 bytes.
+ *
+ * @return Number of CAN data bytes transmitted on success, -1 on error.
  */
 int transport_send_packet(comm_packet_t *packet)
 {
-    /* CAN DLC=8 → max payload = 8 - 5 overhead bytes = 3 bytes */
-    if (!packet || packet->length > 3u)
+    /* Classic CAN: DLC max 8 */
+    if (!packet || packet->length > 8u)
         return -1;
 
     can_frame_t frame;
 
-    frame.id = 0x123;   /* bootloader CAN identifier — adjust as needed */
+    /*
+     * CMD  → CAN_ID
+     * Use the command code as the CAN identifier so any node on the
+     * bus can filter bootloader traffic by ID range.
+     */
+    frame.id = (uint32_t)packet->command;
 
-    /* ---- Build CAN frame payload --------------------------------- */
-    frame.data[0] = packet->command;
-    frame.data[1] = (uint8_t)((packet->length >> 8) & 0xFFu);
-    frame.data[2] = (uint8_t)( packet->length        & 0xFFu);
+    /*
+     * length  → DLC
+     */
+    frame.len = (uint8_t)packet->length;
 
+    /*
+     * payload bytes  → data[0..DLC-1]
+     * No CMD byte, no LEN bytes, no CRC bytes in the data field.
+     */
     if (packet->length > 0u)
-        memcpy(&frame.data[3], packet->data, packet->length);
+        memcpy(frame.data, packet->data, packet->length);
 
-    /* ---- Compute CRC over CMD + LEN_H + LEN_L + DATA ------------ */
-    uint16_t crc = crc16_ccitt(&frame.data[0],
-                               (uint16_t)(packet->length + 3u));
-
-    frame.data[3u + packet->length] = (uint8_t)((crc >> 8) & 0xFFu);
-    frame.data[4u + packet->length] = (uint8_t)( crc        & 0xFFu);
-
-    frame.len = (uint8_t)(packet->length + 5u);
-
-    /* ---- Transmit ------------------------------------------------ */
     return can_transmit(frame.id, frame.data, frame.len);
 }
 

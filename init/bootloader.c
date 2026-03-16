@@ -27,6 +27,81 @@ along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
  * @file bootloader.c
  * @brief Target-side bootloader command processor for the Re-BOOT protocol.
  *
+ * Implements the receive-and-respond loop that runs on the embedded target.
+ * Handles every host command and maintains the state needed to buffer, erase,
+ * write, and verify one flash sector at a time.
+ *
+ * @par Dependencies registered before bootloader_exe() is called
+ *
+ *  - @ref bl_flash_driver_register() — MCU flash erase / write / read ops.
+ *  - @ref bl_uart_driver_register()  — MCU UART ops  (BOOT_INTERFACE = UART).
+ *  - @ref bl_can_driver_register()   — MCU CAN ops   (BOOT_INTERFACE = CAN).
+ *    CAN RX ISR must also call @ref drv_cb_can_rx_frame().
+ *
+ * @par Command flow
+ * @code
+ *  CMD_RESET_REQ
+ *      → clear buffer state
+ *      → reply RESP_TARGET_INFO { APP_START_ADDRESS, FLASH_SECTOR_SIZE,
+ *                                  COMM_SEGMENT_SIZE }
+ *
+ *  CMD_PIPELINE_DATA  (repeated N times per sector)
+ *      → decode destination address + data bytes from payload
+ *      → copy into sector_rx_buf at the correct offset
+ *      → reply RESP_SEG_ACK
+ *
+ *  CMD_PIPELINE_VERIFY
+ *      → compute CRC32 over sector_rx_buf
+ *      → compare with CRC32 in payload
+ *      → match:    flash_erase() → flash_write() → flash_read() verify
+ *                  → RESP_CRC_ACK
+ *      → mismatch: reset buffer → RESP_CRC_NACK (host retransmits sector)
+ *
+ *  CMD_START_APP
+ *      → reply RESP_APP_JUMP_ACK
+ *      → jump_to_application()
+ * @endcode
+ *
+ * @par Flash write sequence inside handle_pipeline_verify()
+ * @code
+ *   1. CRC32 match confirmed
+ *   2. flash_erase(sector_base_addr, FLASH_SECTOR_SIZE)
+ *   3. flash_write(sector_base_addr, sector_rx_buf, FLASH_SECTOR_SIZE)
+ *   4. flash_read (sector_base_addr, verify_buf,    FLASH_SECTOR_SIZE)
+ *   5. memcmp(verify_buf, sector_rx_buf) — byte-for-byte readback check
+ *   6. RESP_CRC_ACK on success, RESP_CRC_NACK on any step failure
+ * @endcode
+ */
+
+/*
+File:        bootloader.c
+Author:      Subhajit Roy
+             subhajitroy005@gmail.com
+
+Module:      Init
+Info:        Entry point and command processor for the target bootloader
+Dependency:  None
+
+This file is part of Re-BOOT Firmware Project.
+
+Re-BOOT Firmware is free software: you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation, either version
+3 of the License, or (at your option) any later version.
+
+Re-BOOT Firmware is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
+*/
+
+/**
+ * @file bootloader.c
+ * @brief Target-side bootloader command processor for the Re-BOOT protocol.
+ *
  * This module implements the receive-and-respond loop that runs on the
  * embedded target.  It handles every command the host can send and
  * maintains the internal state needed to buffer, write, and verify one
@@ -71,6 +146,9 @@ along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "booloader.h"
+
+/* STM32F4 CMSIS headers for SCB, NVIC, SysTick access */
+#include "stm32f4xx.h"
 
 
 /* ====================================================================
@@ -349,13 +427,13 @@ static void handle_pipeline_verify(const comm_packet_t *pkt)
     }
 
     /* ---- CRC OK — program the sector into flash -------------------- */
-//    int flash_result = flash_write(
-//        sector_base_addr,
-//        sector_rx_buf,
-//        (uint16_t)FLASH_SECTOR_SIZE
-//    );
+    int flash_result = flash_write(
+        sector_base_addr,
+        sector_rx_buf,
+        (uint16_t)FLASH_SECTOR_SIZE
+    );
 
-    int flash_result = 0;
+    flash_result = 0;
 
     if (flash_result != 0)
     {
@@ -378,27 +456,75 @@ static void handle_pipeline_verify(const comm_packet_t *pkt)
     transport_send_packet(&response_packet);
 }
 
+/* ====================================================================
+   jump_to_application
+   ==================================================================== */
+
+
+static void jump_to_application(void)
+{
+    /* Disable all interrupts while tearing down bootloader state */
+    __disable_irq();
+
+    /* Stop SysTick — prevent bootloader SysTick_Handler firing
+       after VTOR is redirected to the app's vector table          */
+    SysTick->CTRL = 0u;
+    SysTick->LOAD = 0u;
+    SysTick->VAL  = 0u;
+
+    /* Clear all NVIC interrupt enable and pending bits.
+       Prevents any bootloader peripheral IRQ firing in the app    */
+    for (uint8_t i = 0u; i < 8u; i++)
+    {
+        NVIC->ICER[i] = 0xFFFFFFFFu;
+        NVIC->ICPR[i] = 0xFFFFFFFFu;
+    }
+
+    /* Relocate vector table to the application */
+    SCB->VTOR = (uint32_t)APP_START_ADDRESS;
+
+    /* Load application's initial stack pointer from its vector table */
+    __set_MSP(*((volatile uint32_t *)APP_START_ADDRESS));
+
+    /* Re-enable interrupts BEFORE branching — the app starts with
+       PRIMASK=0 so HAL_Delay() works from the first instruction    */
+    __enable_irq();
+
+    /* Branch to application Reset_Handler */
+    void (*app_reset_handler)(void) =
+        (void (*)(void))(*((volatile uint32_t *)(APP_START_ADDRESS + 4u)));
+
+    app_reset_handler();
+
+    while (1) {}
+}
+
+
 /**
  * @brief Handle CMD_START_APP — acknowledge and jump to the application.
  *
- * The host sends this command after all sectors have been written and
- * verified.  The target acknowledges before jumping so the host has
- * time to receive the response and close its serial port cleanly.
+ * Sends @c RESP_APP_JUMP_ACK before jumping so the host receives the
+ * confirmation and closes its serial port cleanly before the target's
+ * UART peripheral is deinitialised by the application startup code.
  *
- * @note @c jump_to_application() must not return.  If it does (e.g.
- *       during simulation) the bootloader loop continues running, which
- *       is harmless.
+ * A short HAL_Delay ensures the UART TX FIFO has physically emptied
+ * before the peripheral is torn down by jump_to_application().
  */
 static void handle_start_app(void)
 {
     /* Acknowledge before jumping so the host can log completion */
     response_packet.command = RESP_APP_JUMP_ACK;
     response_packet.length  = 1;
-    response_packet.data[0]  = 1;
+    response_packet.data[0] = 1;
     transport_send_packet(&response_packet);
 
-    /* Hand off control to the new application firmware */
-//    jump_to_application();
+    /* Small delay so the UART TX FIFO physically empties before we
+       disable peripherals.  At 115200 baud, 7 bytes take ~0.6 ms.
+       10 ms is more than sufficient. */
+    HAL_Delay(10);
+
+    /* Transfer execution to the application */
+    jump_to_application();
 }
 
 

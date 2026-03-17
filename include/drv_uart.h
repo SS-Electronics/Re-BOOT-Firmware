@@ -3,8 +3,8 @@ File:        drv_uart.h
 Author:      Subhajit Roy
              subhajitroy005@gmail.com
 
-Module:      Driver
-Info:        UART Driver Abstraction
+Module:      include
+Info:        UART driver abstraction — register ops, TX/RX API and RX callback
 Dependency:  None
 
 This file is part of Re-BOOT Firmware Project.

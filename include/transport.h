@@ -1,10 +1,10 @@
 /*
-File:        transport.c
+File:        transport.h
 Author:      Subhajit Roy
              subhajitroy005@gmail.com
 
-Module:      comm
-Info:        Communication Abstraction
+Module:      include
+Info:        Transport layer packet framing — send/receive API
 Dependency:  None
 
 This file is part of Re-BOOT Firmware Project.

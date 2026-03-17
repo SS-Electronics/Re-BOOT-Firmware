@@ -3,8 +3,8 @@ File:        drv_can.h
 Author:      Subhajit Roy
              subhajitroy005@gmail.com
 
-Module:      Driver
-Info:        CAN Driver Abstraction
+Module:      include
+Info:        CAN driver abstraction — register ops, TX/RX API and RX frame callback
 Dependency:  None
 
 This file is part of Re-BOOT Firmware Project.

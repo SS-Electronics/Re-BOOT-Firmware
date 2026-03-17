@@ -3,8 +3,8 @@ File:        bl_types.h
 Author:      Subhajit Roy
              subhajitroy005@gmail.com
 
-Module:      Include
-Info:        Generic types and includes across project
+Module:      include
+Info:        Generic types and standard includes shared across the project
 Dependency:  None
 
 This file is part of Re-BOOT Firmware Project.

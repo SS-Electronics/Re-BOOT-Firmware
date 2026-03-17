@@ -33,6 +33,8 @@ along with Re-BOOT. If not, see <https://www.gnu.org/licenses/>.
 #include "drv_uart.h"
 #include "drv_can.h"
 #include "drv_flash.h"
+#include "drv_delay.h"
+#include "drv_jump.h"
 
 #include "transport.h"
 

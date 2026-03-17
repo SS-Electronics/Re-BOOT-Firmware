@@ -146,9 +146,31 @@ along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "booloader.h"
+/* No MCU-specific headers in this file.
+ * All hardware operations (flash, uart, delay, application jump) are
+ * forwarded through registered driver callbacks.  See drv_flash.h,
+ * drv_uart.h, drv_delay.h, and drv_jump.h. */
 
-/* STM32F4 CMSIS headers for SCB, NVIC, SysTick access */
-#include "stm32f4xx.h"
+/**
+ * @defgroup APP_VALID_FLAG Application-valid firmware flag
+ * @{
+ *
+ * The byte at (APP_START_ADDRESS - 1) acts as a single-bit firmware-
+ * validity sentinel stored in the last byte of the bootloader's reserved
+ * flash region (Sector 1 on STM32F411, 0x08004000 – 0x08007FFF).
+ *
+ * Convention:
+ *   0x00 — valid firmware has been flashed; jump to app on next boot
+ *   0xFF — no valid firmware (erased flash); stay in bootloader
+ *
+ * The flag is written to 0x00 by handle_start_app() after a successful
+ * firmware update, just before the first application jump.  It is never
+ * erased by the bootloader (only a full chip erase would clear it), so
+ * subsequent power-cycles see 0x00 and fast-boot directly into the app.
+ */
+#define APP_VALID_FLAG_ADDR   (APP_START_ADDRESS - 1u)
+#define APP_VALID_FLAG_VALUE  (0x00u)
+/** @} */
 
 
 /* ====================================================================
@@ -456,59 +478,18 @@ static void handle_pipeline_verify(const comm_packet_t *pkt)
     transport_send_packet(&response_packet);
 }
 
-/* ====================================================================
-   jump_to_application
-   ==================================================================== */
-
-
-static void jump_to_application(void)
-{
-    /* Disable all interrupts while tearing down bootloader state */
-    __disable_irq();
-
-    /* Stop SysTick — prevent bootloader SysTick_Handler firing
-       after VTOR is redirected to the app's vector table          */
-    SysTick->CTRL = 0u;
-    SysTick->LOAD = 0u;
-    SysTick->VAL  = 0u;
-
-    /* Clear all NVIC interrupt enable and pending bits.
-       Prevents any bootloader peripheral IRQ firing in the app    */
-    for (uint8_t i = 0u; i < 8u; i++)
-    {
-        NVIC->ICER[i] = 0xFFFFFFFFu;
-        NVIC->ICPR[i] = 0xFFFFFFFFu;
-    }
-
-    /* Relocate vector table to the application */
-    SCB->VTOR = (uint32_t)APP_START_ADDRESS;
-
-    /* Load application's initial stack pointer from its vector table */
-    __set_MSP(*((volatile uint32_t *)APP_START_ADDRESS));
-
-    /* Re-enable interrupts BEFORE branching — the app starts with
-       PRIMASK=0 so HAL_Delay() works from the first instruction    */
-    __enable_irq();
-
-    /* Branch to application Reset_Handler */
-    void (*app_reset_handler)(void) =
-        (void (*)(void))(*((volatile uint32_t *)(APP_START_ADDRESS + 4u)));
-
-    app_reset_handler();
-
-    while (1) {}
-}
-
 
 /**
- * @brief Handle CMD_START_APP — acknowledge and jump to the application.
+ * @brief Handle CMD_START_APP — mark firmware valid, acknowledge, and jump.
  *
- * Sends @c RESP_APP_JUMP_ACK before jumping so the host receives the
- * confirmation and closes its serial port cleanly before the target's
- * UART peripheral is deinitialised by the application startup code.
- *
- * A short HAL_Delay ensures the UART TX FIFO has physically emptied
- * before the peripheral is torn down by jump_to_application().
+ * Sequence:
+ *  1. Send RESP_APP_JUMP_ACK so the host can close the session cleanly.
+ *  2. Allow the UART TX FIFO to drain (10 ms via registered delay driver —
+ *     no HAL dependency here).
+ *  3. Write 0x00 to APP_VALID_FLAG_ADDR so that on the next power-cycle
+ *     the bootloader detects a valid firmware and fast-boots into the app
+ *     after a 500 ms window.
+ *  4. Jump to the application.
  */
 static void handle_start_app(void)
 {
@@ -518,13 +499,22 @@ static void handle_start_app(void)
     response_packet.data[0] = 1;
     transport_send_packet(&response_packet);
 
-    /* Small delay so the UART TX FIFO physically empties before we
-       disable peripherals.  At 115200 baud, 7 bytes take ~0.6 ms.
-       10 ms is more than sufficient. */
-    HAL_Delay(10);
+    /* Allow UART TX FIFO to drain.  At 115200 baud, 7 bytes take ~0.6 ms;
+       10 ms is more than sufficient.  Uses registered delay driver —
+       no direct HAL call in this file. */
+    delay_ms(10u);
 
-    /* Transfer execution to the application */
-    jump_to_application();
+    /* Mark firmware as valid.  Writing 0x00 to a byte that reads 0xFF
+       (erased flash) requires only a program operation — no sector erase.
+       On STM32F4 this single byte lives in Sector 1 (0x08004000–0x08007FFF)
+       which is never touched during normal firmware updates. */
+    uint8_t valid_flag = APP_VALID_FLAG_VALUE;
+    flash_write(APP_VALID_FLAG_ADDR, &valid_flag, 1u);
+
+    /* Transfer execution to the application.
+     * MCU-specific teardown (NVIC, SysTick, VTOR, MSP) is performed by
+     * the registered jump driver — no CMSIS headers needed here. */
+    bl_app_jump();
 }
 
 
@@ -597,9 +587,59 @@ void bootloader_exe(void)
 {
     comm_packet_t rx_packet;   /* declared once, outside the loop */
 
+    /* Discard any partial sector data from a previous (failed) session */
+        reset_sector_state();
+
+	/* ---- Build RESP_TARGET_INFO payload ----------------------------- */
+	response_packet.command = RESP_TARGET_INFO;
+	response_packet.length  = 8;
+
+	/* Flash start address — 4 bytes, MSB first */
+	response_packet.data[0] = (APP_START_ADDRESS >> 24) & 0xFF;
+	response_packet.data[1] = (APP_START_ADDRESS >> 16) & 0xFF;
+	response_packet.data[2] = (APP_START_ADDRESS >>  8) & 0xFF;
+	response_packet.data[3] = (APP_START_ADDRESS >>  0) & 0xFF;
+
+	/* Sector size — 2 bytes, MSB first */
+	response_packet.data[4] = (FLASH_SECTOR_SIZE >> 8) & 0xFF;
+	response_packet.data[5] =  FLASH_SECTOR_SIZE        & 0xFF;
+
+	/* Segment size — 2 bytes, MSB first */
+	response_packet.data[6] = (COMM_SEGMENT_SIZE >> 8) & 0xFF;
+	response_packet.data[7] =  COMM_SEGMENT_SIZE        & 0xFF;
+
+	transport_send_packet(&response_packet);
+
+    /* ----------------------------------------------------------------
+     * Firmware-validity check
+     *
+     * Read the sentinel byte at (APP_START_ADDRESS - 1).
+     *
+     *   0x00 → valid firmware has been programmed previously.
+     *           Wait 500 ms (allows a host to assert a reflash trigger
+     *           if needed, e.g. via a BOOT0 pin or a dedicated signal),
+     *           then jump directly into the application.
+     *
+     *   0xFF → flash is erased / no valid firmware.
+     *           Fall through to the normal bootloader receive loop and
+     *           wait for the host to initiate a firmware update session.
+     *
+     * Any other non-zero value is treated the same as 0xFF — stay in
+     * bootloader.  This covers partially-programmed or corrupted flags.
+     * ---------------------------------------------------------------- */
+    uint8_t app_flag = *(volatile uint8_t *)APP_VALID_FLAG_ADDR;
+
+    if (app_flag == APP_VALID_FLAG_VALUE)
+    {
+        /* Valid firmware present — short window then fast-boot */
+        delay_ms(500u);
+        bl_app_jump();
+        /* never returns */
+    }
+
+    /* No valid firmware — initialise transport and wait for host */
     uart_init();
     uart_flush();
-    reset_sector_state();
 
     while (1)
     {

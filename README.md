@@ -227,138 +227,295 @@ void drv_cb_can_rx_frame(const can_frame_t *frame);
 
 ## Configuration
 
-Edit `include/reboot_config.h` (or add it to your project's include path):
+Place `reboot_config.h` on your compiler's include path. Below is the actual configuration used for the STM32F411 reference target:
 
 ```c
-/* Application start address — must be sector-aligned */
-#define APP_START_ADDRESS    0x08008000UL
+/*
+ * reboot_config.h
+ */
 
-/* Flash sector size in bytes */
-#define FLASH_SECTOR_SIZE    16384U          /* 16 KB */
+#ifndef INC_REBOOT_CONFIG_H_
+#define INC_REBOOT_CONFIG_H_
 
-/* Max firmware data bytes per CMD_PIPELINE_DATA packet */
-#define COMM_SEGMENT_SIZE    64U
+/* ---- Interface selection ------------------------------------------- */
+#define BL_INTERFACE_UART   1
+#define BL_INTERFACE_CAN    2
+#define BL_INTERFACE_TCP    3
 
-/* Communication interface selection */
-#define BL_INTERFACE_UART    1
-#define BL_INTERFACE_CAN     2
-#define BL_INTERFACE_TCP     3
+#define BOOT_INTERFACE      BL_INTERFACE_UART   /* change to CAN or TCP as needed */
 
-#define BOOT_INTERFACE       BL_INTERFACE_UART
+/* ---- RX ring buffer sizes ------------------------------------------ */
+#define UART_RX_BUFFER_SIZE 512
+#define CAN_RX_BUFFER_SIZE  512
 
-/* RX ring buffer sizes */
-#define UART_RX_BUFFER_SIZE  256U
-#define CAN_RX_BUFFER_SIZE   32U
+/* ---- Flash / protocol parameters ----------------------------------- */
+#define APP_START_ADDRESS   (0x08008000U)   /* Sector 2 on STM32F411 */
+#define FLASH_SECTOR_SIZE   (256)           /* bytes per pipeline sector */
+#define COMM_SEGMENT_SIZE   (8)             /* bytes per CMD_PIPELINE_DATA payload */
+
+#endif /* INC_REBOOT_CONFIG_H_ */
 ```
+
+> **Note:** `FLASH_SECTOR_SIZE` is the pipeline transfer unit, not the physical erase sector size.
+> The physical sector size on the STM32F411 is 16 KB; each erase call covers the full physical sector.
 
 ---
 
 ## Integration Example (STM32CubeIDE / HAL)
 
-```c
-/* Core/Src/main.c */
-#include "booloader.h"
+The following is the complete `Core/Src/main.c` from the reference STM32F411 project.
+Add source files from Re-BOOT-Firmware to your STM32CubeIDE project and drop this user code
+into the generated `main.c` skeleton.
 
-/* ---- 1. MCU-specific implementations -------------------------------- */
+### Step 1 — Includes and private variables
+
+```c
+/* USER CODE BEGIN Includes */
+#include "booloader.h"
+/* USER CODE END Includes */
+
+/* USER CODE BEGIN PV */
+volatile uint8_t uart_rx_byte;
+/* USER CODE END PV */
+```
+
+### Step 2 — Function prototypes
+
+```c
+/* USER CODE BEGIN PFP */
+void    mcu_uart_init(void);
+void    mcu_uart_close(void);
+int32_t mcu_uart_tx(const uint8_t *data, int16_t len);
+int32_t mcu_uart_rx(uint8_t *data, uint16_t maxlen);
+
+static int32_t mcu_flash_erase(uint32_t address, uint32_t size);
+static int32_t mcu_flash_write(uint32_t address, const uint8_t *data, uint32_t size);
+static int32_t mcu_flash_read (uint32_t address, uint8_t *buf, uint32_t size);
+static int32_t addr_to_sector (uint32_t address, uint32_t *sector);
+static void    mcu_jump_to_application(void);
+/* USER CODE END PFP */
+```
+
+### Step 3 — Driver ops structs (before main)
+
+```c
+/* USER CODE BEGIN 0 */
+uart_ops_t uart_ops =
+{
+    .init     = mcu_uart_init,
+    .close    = mcu_uart_close,
+    .transmit = mcu_uart_tx,
+    .receive  = mcu_uart_rx
+};
+
+static const flash_ops_t flash_ops =
+{
+    .erase = mcu_flash_erase,
+    .write = mcu_flash_write,
+    .read  = mcu_flash_read,
+};
+/* USER CODE END 0 */
+```
+
+### Step 4 — Register and run (inside main)
+
+```c
+/* USER CODE BEGIN 2 */
+bl_uart_driver_register(&uart_ops);
+bl_flash_driver_register(&flash_ops);
+bl_delay_driver_register(HAL_Delay);
+bl_jump_driver_register(mcu_jump_to_application);
+bootloader_exe();   /* never returns */
+/* USER CODE END 2 */
+```
+
+### Step 5 — UART driver implementation
+
+```c
+/* USER CODE BEGIN 4 */
+
+void mcu_uart_init(void)
+{
+    /* Peripheral already initialised by MX_USART2_UART_Init().
+       Start the first byte-level RX interrupt so the ring buffer
+       begins accumulating data immediately.                        */
+    HAL_UART_Receive_IT(&huart2, (uint8_t *)&uart_rx_byte, 1);
+}
+
+void mcu_uart_close(void)
+{
+    HAL_UART_AbortReceive_IT(&huart2);
+    HAL_UART_DeInit(&huart2);
+}
+
+int32_t mcu_uart_tx(const uint8_t *data, int16_t len)
+{
+    if (HAL_UART_Transmit(&huart2, (uint8_t *)data, len, HAL_MAX_DELAY) == HAL_OK)
+        return len;
+    return -1;
+}
+
+int32_t mcu_uart_rx(uint8_t *data, uint16_t maxlen)
+{
+    if (HAL_UART_Receive(&huart2, data, maxlen, HAL_MAX_DELAY) == HAL_OK)
+        return maxlen;
+    return -1;
+}
+
+/* UART RX complete callback — called from HAL UART ISR.
+   Push each byte into the Re-BOOT ring buffer, then restart
+   the interrupt for the next byte.                            */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    drv_cb_uart_rx_byte(uart_rx_byte);
+    HAL_UART_Receive_IT(&huart2, (uint8_t *)&uart_rx_byte, 1);
+}
+```
+
+### Step 6 — Flash driver implementation
+
+```c
+/* Helper: translate an absolute flash address to an STM32F4 sector number.
+ *
+ * STM32F411 sector map:
+ *   Sector 0 : 0x0800_0000 – 0x0800_3FFF   16 KB  (bootloader)
+ *   Sector 1 : 0x0800_4000 – 0x0800_7FFF   16 KB  (flag byte at 0x0800_7FFF)
+ *   Sector 2 : 0x0800_8000 – 0x0800_BFFF   16 KB  (application start)
+ *   Sector 3 : 0x0800_C000 – 0x0800_FFFF   16 KB
+ *   Sector 4 : 0x0801_0000 – 0x0801_FFFF   64 KB
+ *   Sector 5 : 0x0802_0000 – 0x0803_FFFF  128 KB
+ *   Sector 6 : 0x0804_0000 – 0x0805_FFFF  128 KB
+ *   Sector 7 : 0x0806_0000 – 0x0807_FFFF  128 KB
+ */
+static int32_t addr_to_sector(uint32_t address, uint32_t *sector)
+{
+    if      (address < 0x08004000u) { *sector = FLASH_SECTOR_0; }
+    else if (address < 0x08008000u) { *sector = FLASH_SECTOR_1; }
+    else if (address < 0x0800C000u) { *sector = FLASH_SECTOR_2; }
+    else if (address < 0x08010000u) { *sector = FLASH_SECTOR_3; }
+    else if (address < 0x08020000u) { *sector = FLASH_SECTOR_4; }
+    else if (address < 0x08040000u) { *sector = FLASH_SECTOR_5; }
+    else if (address < 0x08060000u) { *sector = FLASH_SECTOR_6; }
+    else if (address < 0x08080000u) { *sector = FLASH_SECTOR_7; }
+    else                            { return -1; }
+    return 0;
+}
 
 static int32_t mcu_flash_erase(uint32_t address, uint32_t size)
 {
-    HAL_FLASH_Unlock();
-    FLASH_EraseInitTypeDef cfg = {
+    (void)size;  /* STM32F4 erases full sectors only */
+
+    uint32_t sector = 0u;
+    if (addr_to_sector(address, &sector) != 0)
+        return -1;
+
+    if (HAL_FLASH_Unlock() != HAL_OK)
+        return -1;
+
+    FLASH_EraseInitTypeDef erase_cfg =
+    {
         .TypeErase    = FLASH_TYPEERASE_SECTORS,
-        .Sector       = /* derive from address */,
-        .NbSectors    = 1,
-        .VoltageRange = FLASH_VOLTAGE_RANGE_3
+        .VoltageRange = FLASH_VOLTAGE_RANGE_3,   /* 2.7 V – 3.6 V supply */
+        .Sector       = sector,
+        .NbSectors    = 1u,
     };
-    uint32_t err;
-    HAL_StatusTypeDef s = HAL_FLASHEx_Erase(&cfg, &err);
+
+    uint32_t sector_error = 0u;
+    HAL_StatusTypeDef status = HAL_FLASHEx_Erase(&erase_cfg, &sector_error);
     HAL_FLASH_Lock();
-    return (s == HAL_OK) ? 0 : -1;
+
+    return (status == HAL_OK) ? 0 : -1;
 }
 
 static int32_t mcu_flash_write(uint32_t address,
-                                const uint8_t *data, uint32_t size)
+                                const uint8_t *data,
+                                uint32_t size)
 {
-    HAL_FLASH_Unlock();
-    for (uint32_t i = 0; i < size; i += 4)
-    {
-        uint32_t word = *(uint32_t *)(data + i);
-        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,
-                              address + i, word) != HAL_OK)
-        {
-            HAL_FLASH_Lock();
-            return -1;
-        }
-    }
-    /* Single-byte path for non-word-aligned writes (e.g. validity flag) */
+    if (HAL_FLASH_Unlock() != HAL_OK)
+        return -1;
+
+    HAL_StatusTypeDef status = HAL_OK;
+
+    /* Single-byte path — used for the validity flag at APP_START_ADDRESS-1
+       which is not word-aligned.  FLASH_TYPEPROGRAM_BYTE handles any address. */
     if (size == 1u)
     {
-        HAL_StatusTypeDef s =
-            HAL_FLASH_Program(FLASH_TYPEPROGRAM_BYTE, address,
-                              (uint64_t)data[0]);
+        status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_BYTE,
+                                   address, (uint64_t)data[0]);
         HAL_FLASH_Lock();
-        return (s == HAL_OK) ? 0 : -1;
+        return (status == HAL_OK) ? 0 : -1;
     }
+
+    /* Multi-byte word-aligned path (normal sector programming).
+       Packs 4 bytes per word, padding the final partial word with 0xFF. */
+    uint32_t i = 0u;
+    while ((i < size) && (status == HAL_OK))
+    {
+        uint32_t word       = 0xFFFFFFFFu;
+        uint32_t bytes_left = size - i;
+        uint32_t chunk      = (bytes_left >= 4u) ? 4u : bytes_left;
+
+        for (uint32_t b = 0u; b < chunk; b++)
+            word = (word & ~(0xFFu << (b * 8u))) |
+                   ((uint32_t)data[i + b] << (b * 8u));
+
+        status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,
+                                   (uint32_t)(address + i), (uint64_t)word);
+        i += 4u;
+    }
+
     HAL_FLASH_Lock();
-    return 0;
+    return (status == HAL_OK) ? 0 : -1;
 }
 
-static int32_t mcu_flash_read(uint32_t address,
-                               uint8_t *buf, uint32_t size)
+static int32_t mcu_flash_read(uint32_t address, uint8_t *buf, uint32_t size)
 {
-    memcpy(buf, (void *)address, size);
+    if (buf == NULL)
+        return -1;
+    /* Internal flash is memory-mapped — direct memcpy is correct */
+    memcpy(buf, (const void *)address, size);
     return 0;
 }
+```
 
+### Step 7 — Application jump implementation
+
+```c
+/* All CMSIS register access is isolated here so bootloader.c has zero
+   MCU dependencies.  Sequence:
+     1. Disable global IRQs
+     2. Stop SysTick
+     3. Clear NVIC ICER / ICPR (all 8 registers → 240 IRQs)
+     4. Relocate VTOR to APP_START_ADDRESS
+     5. Load application MSP from its vector table
+     6. Re-enable IRQs
+     7. Branch to application Reset_Handler              */
 static void mcu_jump_to_application(void)
 {
     __disable_irq();
-    SysTick->CTRL = 0u; SysTick->LOAD = 0u; SysTick->VAL = 0u;
-    for (uint8_t i = 0; i < 8u; i++) {
+
+    SysTick->CTRL = 0u;
+    SysTick->LOAD = 0u;
+    SysTick->VAL  = 0u;
+
+    for (uint8_t i = 0u; i < 8u; i++)
+    {
         NVIC->ICER[i] = 0xFFFFFFFFu;
         NVIC->ICPR[i] = 0xFFFFFFFFu;
     }
+
     SCB->VTOR = (uint32_t)APP_START_ADDRESS;
     __set_MSP(*((volatile uint32_t *)APP_START_ADDRESS));
     __enable_irq();
-    void (*reset_handler)(void) =
+
+    void (*app_reset_handler)(void) =
         (void (*)(void))(*((volatile uint32_t *)(APP_START_ADDRESS + 4u)));
-    reset_handler();
-    while (1) {}
+
+    app_reset_handler();
+    while (1) {}   /* never reached */
 }
 
-/* ---- 2. UART RX interrupt — feed the ring buffer -------------------- */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    drv_cb_uart_rx_byte(rx_byte);
-    HAL_UART_Receive_IT(huart, &rx_byte, 1);
-}
-
-/* ---- 3. Register drivers and run ------------------------------------ */
-int main(void)
-{
-    HAL_Init();
-    SystemClock_Config();
-
-    static const flash_ops_t flash_ops = {
-        .erase = mcu_flash_erase,
-        .write = mcu_flash_write,
-        .read  = mcu_flash_read,
-    };
-    static const uart_ops_t uart_ops = {
-        .init     = mcu_uart_init,
-        .close    = mcu_uart_close,
-        .transmit = mcu_uart_transmit,
-        .receive  = mcu_uart_receive,
-    };
-
-    bl_flash_driver_register(&flash_ops);
-    bl_uart_driver_register(&uart_ops);
-    bl_delay_driver_register(HAL_Delay);
-    bl_jump_driver_register(mcu_jump_to_application);
-
-    bootloader_exe();   /* never returns */
-}
+/* USER CODE END 4 */
 ```
 
 ---

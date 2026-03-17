@@ -3,8 +3,8 @@ File:        global.h
 Author:      Subhajit Roy
              subhajitroy005@gmail.com
 
-Module:      Include
-Info:        Global Data
+Module:      include
+Info:        Global project-wide definitions and shared data
 Dependency:  None
 
 This file is part of Re-BOOT Firmware Project.

@@ -3,8 +3,8 @@ File:        bootloader.c
 Author:      Subhajit Roy
              subhajitroy005@gmail.com
 
-Module:      Init
-Info:        Entry point and command processor for the target bootloader
+Module:      init
+Info:        Bootloader command processor — receive loop, sector write, app jump
 Dependency:  None
 
 This file is part of Re-BOOT Firmware Project.
@@ -27,122 +27,33 @@ along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
  * @file bootloader.c
  * @brief Target-side bootloader command processor for the Re-BOOT protocol.
  *
- * Implements the receive-and-respond loop that runs on the embedded target.
- * Handles every host command and maintains the state needed to buffer, erase,
- * write, and verify one flash sector at a time.
+ * Implements the receive-and-respond loop running on the embedded target.
+ * Handles all host commands and maintains state to buffer, erase, write,
+ * and CRC-verify one flash sector at a time.
  *
- * @par Dependencies registered before bootloader_exe() is called
+ * @par Driver dependencies — must be registered before bootloader_exe()
  *
  *  - @ref bl_flash_driver_register() — MCU flash erase / write / read ops.
  *  - @ref bl_uart_driver_register()  — MCU UART ops  (BOOT_INTERFACE = UART).
  *  - @ref bl_can_driver_register()   — MCU CAN ops   (BOOT_INTERFACE = CAN).
- *    CAN RX ISR must also call @ref drv_cb_can_rx_frame().
+ *  - @ref bl_delay_driver_register() — MCU ms-delay (e.g. HAL_Delay).
+ *  - @ref bl_jump_driver_register()  — MCU application-jump sequence.
  *
  * @par Command flow
  * @code
- *  CMD_RESET_REQ
- *      → clear buffer state
- *      → reply RESP_TARGET_INFO { APP_START_ADDRESS, FLASH_SECTOR_SIZE,
- *                                  COMM_SEGMENT_SIZE }
- *
- *  CMD_PIPELINE_DATA  (repeated N times per sector)
- *      → decode destination address + data bytes from payload
- *      → copy into sector_rx_buf at the correct offset
- *      → reply RESP_SEG_ACK
- *
- *  CMD_PIPELINE_VERIFY
- *      → compute CRC32 over sector_rx_buf
- *      → compare with CRC32 in payload
- *      → match:    flash_erase() → flash_write() → flash_read() verify
- *                  → RESP_CRC_ACK
- *      → mismatch: reset buffer → RESP_CRC_NACK (host retransmits sector)
- *
- *  CMD_START_APP
- *      → reply RESP_APP_JUMP_ACK
- *      → jump_to_application()
+ *  CMD_RESET_REQ       → RESP_TARGET_INFO { APP_START_ADDRESS,
+ *                                           FLASH_SECTOR_SIZE, COMM_SEGMENT_SIZE }
+ *  CMD_PIPELINE_DATA   → buffer segment into sector_rx_buf → RESP_SEG_ACK
+ *  CMD_PIPELINE_VERIFY → CRC32 check → flash_erase + flash_write → RESP_CRC_ACK
+ *                                                                  / RESP_CRC_NACK
+ *  CMD_START_APP       → write valid-flag → RESP_APP_JUMP_ACK → bl_app_jump()
  * @endcode
  *
- * @par Flash write sequence inside handle_pipeline_verify()
- * @code
- *   1. CRC32 match confirmed
- *   2. flash_erase(sector_base_addr, FLASH_SECTOR_SIZE)
- *   3. flash_write(sector_base_addr, sector_rx_buf, FLASH_SECTOR_SIZE)
- *   4. flash_read (sector_base_addr, verify_buf,    FLASH_SECTOR_SIZE)
- *   5. memcmp(verify_buf, sector_rx_buf) — byte-for-byte readback check
- *   6. RESP_CRC_ACK on success, RESP_CRC_NACK on any step failure
- * @endcode
- */
-
-/*
-File:        bootloader.c
-Author:      Subhajit Roy
-             subhajitroy005@gmail.com
-
-Module:      Init
-Info:        Entry point and command processor for the target bootloader
-Dependency:  None
-
-This file is part of Re-BOOT Firmware Project.
-
-Re-BOOT Firmware is free software: you can redistribute it and/or
-modify it under the terms of the GNU General Public License
-as published by the Free Software Foundation, either version
-3 of the License, or (at your option) any later version.
-
-Re-BOOT Firmware is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with Re-BOOT Firmware. If not, see <https://www.gnu.org/licenses/>.
-*/
-
-/**
- * @file bootloader.c
- * @brief Target-side bootloader command processor for the Re-BOOT protocol.
- *
- * This module implements the receive-and-respond loop that runs on the
- * embedded target.  It handles every command the host can send and
- * maintains the internal state needed to buffer, write, and verify one
- * flash sector at a time.
- *
- * @par State held by this module
- *
- * Because the target does not have an FSM framework, all inter-command
- * state lives in four static variables:
- *
- *  - @c sector_rx_buf   — raw byte buffer for the sector currently being
- *                         received (FLASH_SECTOR_SIZE bytes).
- *  - @c sector_base_addr — the flash address of the first byte that will be
- *                          written when CMD_PIPELINE_VERIFY arrives.
- *  - @c write_offset    — next free byte position within @c sector_rx_buf.
- *                         Advanced by each CMD_PIPELINE_DATA packet.
- *  - @c response_packet — single reusable outgoing packet; no dynamic
- *                         allocation needed on a bare-metal target.
- *
- * @par Command flow
- * @code
- *  CMD_RESET_REQ
- *      → clear buffer state
- *      → reply RESP_TARGET_INFO (addr, sector_size, segment_size)
- *
- *  CMD_PIPELINE_DATA  (repeated N times per sector)
- *      → extract destination address + data from payload
- *      → compute offset = dest_addr - sector_base_addr
- *      → copy bytes into sector_rx_buf at that offset
- *      → reply RESP_SEG_ACK
- *
- *  CMD_PIPELINE_VERIFY
- *      → compute CRC32 over sector_rx_buf
- *      → compare with CRC32 received in payload
- *      → on match  : call flash_write(), reply RESP_CRC_ACK
- *      → on mismatch: clear buffer, reply RESP_CRC_NACK
- *
- *  CMD_START_APP
- *      → reply RESP_APP_JUMP_ACK
- *      → call jump_to_application()
- * @endcode
+ * @par Module state
+ *  - @c sector_rx_buf    — accumulates one sector of received data (FLASH_SECTOR_SIZE).
+ *  - @c sector_base_addr — flash address of the first byte in @c sector_rx_buf.
+ *  - @c write_offset     — running byte count for the current sector.
+ *  - @c response_packet  — single reusable outgoing packet (no dynamic alloc).
  */
 
 #include "booloader.h"
@@ -569,78 +480,145 @@ static void process_command(const comm_packet_t *pkt)
 /**
  * @brief Main bootloader execution loop.
  *
- * This function is the top-level entry point called from the MCU's
- * startup code (or @c main()).  It performs hardware initialisation
- * then blocks in a receive loop, dispatching each validated command
- * to @c process_command().
+ * Top-level entry point called from @c main() after all drivers have
+ * been registered.  Never returns under normal operation.
  *
  * @par Execution flow
- *  1. Initialise the UART peripheral via @c uart_init().
- *  2. Flush any garbage bytes from the receive FIFO via @c uart_flush().
- *  3. Pre-fill @c sector_rx_buf with 0xFF and zero the state counters.
- *  4. Enter the infinite receive loop.
  *
- * The function never returns under normal operation.  The only exit
- * point is through @c jump_to_application() inside @c handle_start_app().
+ * @code
+ *   ┌─ Interface init (BOOT_INTERFACE selects at compile time) ─┐
+ *   │  UART : uart_init() + uart_flush()                        │
+ *   │  CAN  : can_init()                                        │
+ *   └───────────────────────────────────────────────────────────┘
+ *            │
+ *            ▼
+ *   handle_reset_req()  ← proactive RESP_TARGET_INFO broadcast
+ *            │             host can start CMD_PIPELINE_DATA immediately
+ *            │
+ *   Read APP_VALID_FLAG_ADDR
+ *   │
+ *   ├─ 0x00  (valid firmware)
+ *   │        ┌──── 500 ms trigger window ────┐
+ *   │        │  poll transport  1 ms / tick  │
+ *   │        │  any valid packet received?   │
+ *   │        └───────────────────────────────┘
+ *   │               │ YES             │ NO (timeout)
+ *   │               ▼                 ▼
+ *   │        process_command()    bl_app_jump()
+ *   │        ↓ fall into loop     (never returns)
+ *   │
+ *   └─ 0xFF  (no firmware / erased flash)
+ *            fall straight into receive loop
+ *
+ *   Receive loop:
+ *     transport_receive_packet() → process_command() → repeat
+ *     CMD_START_APP → write valid-flag → bl_app_jump()
+ * @endcode
+ *
+ * @par Proactive announce
+ * @c handle_reset_req() is called unconditionally on boot.  It resets
+ * all sector state and transmits @c RESP_TARGET_INFO so a host that is
+ * already listening receives target parameters without needing to send
+ * @c CMD_RESET_REQ first.  If the host does send @c CMD_RESET_REQ later
+ * it is handled normally in the receive loop (idempotent).
+ *
+ * @par Trigger-window detail
+ * The ISR ring buffer is live before the flag check so no byte is lost.
+ * @c transport_receive_packet() is non-blocking (returns 0 when empty)
+ * and is polled every 1 ms.  At 115200 baud a 6-byte frame arrives in
+ * < 1 ms — no packet can be missed within the window.
  */
 void bootloader_exe(void)
 {
-    comm_packet_t rx_packet;   /* declared once, outside the loop */
+    comm_packet_t rx_packet;
 
-    /* Discard any partial sector data from a previous (failed) session */
-        reset_sector_state();
-
-	/* ---- Build RESP_TARGET_INFO payload ----------------------------- */
-	response_packet.command = RESP_TARGET_INFO;
-	response_packet.length  = 8;
-
-	/* Flash start address — 4 bytes, MSB first */
-	response_packet.data[0] = (APP_START_ADDRESS >> 24) & 0xFF;
-	response_packet.data[1] = (APP_START_ADDRESS >> 16) & 0xFF;
-	response_packet.data[2] = (APP_START_ADDRESS >>  8) & 0xFF;
-	response_packet.data[3] = (APP_START_ADDRESS >>  0) & 0xFF;
-
-	/* Sector size — 2 bytes, MSB first */
-	response_packet.data[4] = (FLASH_SECTOR_SIZE >> 8) & 0xFF;
-	response_packet.data[5] =  FLASH_SECTOR_SIZE        & 0xFF;
-
-	/* Segment size — 2 bytes, MSB first */
-	response_packet.data[6] = (COMM_SEGMENT_SIZE >> 8) & 0xFF;
-	response_packet.data[7] =  COMM_SEGMENT_SIZE        & 0xFF;
-
-	transport_send_packet(&response_packet);
-
-    /* ----------------------------------------------------------------
-     * Firmware-validity check
+    /* ---- Interface initialisation ----------------------------------------
+     * Start the selected communication peripheral so its ISR ring buffer
+     * begins accumulating bytes / frames before anything else.
      *
+     * UART: initialise the peripheral and flush any power-on garbage.
+     * CAN : initialise the peripheral (CAN RX ISR feeds the frame buffer).
+     * ----------------------------------------------------------------------- */
+#if   (BOOT_INTERFACE == BL_INTERFACE_UART)
+    uart_init();
+    uart_flush();
+#elif (BOOT_INTERFACE == BL_INTERFACE_CAN)
+    can_init();
+#endif
+
+    /* ---- Proactive target announcement -----------------------------------
+     * Broadcast RESP_TARGET_INFO immediately on boot.
+     * A listening host can skip CMD_RESET_REQ and push CMD_PIPELINE_DATA
+     * straight away.  handle_reset_req() also calls reset_sector_state()
+     * internally so no separate state initialisation is needed here.
+     * ----------------------------------------------------------------------- */
+    handle_reset_req();
+
+    /* ---- Firmware-validity check -----------------------------------------
      * Read the sentinel byte at (APP_START_ADDRESS - 1).
      *
-     *   0x00 → valid firmware has been programmed previously.
-     *           Wait 500 ms (allows a host to assert a reflash trigger
-     *           if needed, e.g. via a BOOT0 pin or a dedicated signal),
-     *           then jump directly into the application.
+     *   0x00 — valid firmware.
+     *           Open 500 ms window; poll for any packet from host.
+     *           Packet received → process it, enter update loop.
+     *           Timeout         → bl_app_jump().
      *
-     *   0xFF → flash is erased / no valid firmware.
-     *           Fall through to the normal bootloader receive loop and
-     *           wait for the host to initiate a firmware update session.
-     *
-     * Any other non-zero value is treated the same as 0xFF — stay in
-     * bootloader.  This covers partially-programmed or corrupted flags.
-     * ---------------------------------------------------------------- */
+     *   0xFF (or any non-zero) — no valid firmware / erased flash.
+     *           Fall straight into the receive loop and wait indefinitely.
+     * ----------------------------------------------------------------------- */
     uint8_t app_flag = *(volatile uint8_t *)APP_VALID_FLAG_ADDR;
 
     if (app_flag == APP_VALID_FLAG_VALUE)
     {
-        /* Valid firmware present — short window then fast-boot */
-        delay_ms(500u);
-        bl_app_jump();
-        /* never returns */
+        /* ---- 500 ms trigger window -------------------------------------------
+         * Poll transport_receive_packet() every 1 ms (500 ticks = 500 ms).
+         * The function is non-blocking — it returns 0 when the ring buffer
+         * is empty — so the ISR continues to fill the buffer during each
+         * delay_ms(1) call without missing any incoming bytes / frames.
+         *
+         * Trigger condition: ANY valid packet from the host.
+         *   CMD_PIPELINE_DATA — host starts uploading immediately after
+         *                       receiving the proactive RESP_TARGET_INFO.
+         *   CMD_RESET_REQ     — host follows the normal protocol flow and
+         *                       re-requests target info; accepted for compat.
+         * ----------------------------------------------------------------------- */
+        uint8_t update_requested = 0u;
+
+        for (uint16_t tick = 0u; tick < 500u; tick++)
+        {
+            int ret = transport_receive_packet(&rx_packet);
+
+            if (ret > 0)
+            {
+                /* Any valid packet signals the host wants a firmware update */
+                update_requested = 1u;
+                break;
+            }
+
+            delay_ms(1u);   /* 1 ms tick — ISR fills ring buffer here */
+        }
+
+        if (!update_requested)
+        {
+            /* No host activity within 500 ms — boot existing firmware */
+            bl_app_jump();
+            /* never returns */
+        }
+
+        /* Dispatch the packet that triggered the window (CMD_PIPELINE_DATA
+           or CMD_RESET_REQ) then fall into the main receive loop below.   */
+        process_command(&rx_packet);
+        memset(&rx_packet, 0, sizeof(rx_packet));
     }
 
-    /* No valid firmware — initialise transport and wait for host */
-    uart_init();
-    uart_flush();
-
+    /* ----------------------------------------------------------------
+     * Main receive loop
+     *
+     * Runs for both:
+     *   a) the no-valid-firmware path (fall-through from above), and
+     *   b) after a trigger-window CMD_RESET_REQ was handled above.
+     *
+     * The only exit is CMD_START_APP → handle_start_app() → bl_app_jump().
+     * ---------------------------------------------------------------- */
     while (1)
     {
         int ret = transport_receive_packet(&rx_packet);
@@ -650,7 +628,7 @@ void bootloader_exe(void)
             process_command(&rx_packet);
             memset(&rx_packet, 0, sizeof(rx_packet));
         }
-        /* ret == 0: one byte processed, frame not yet complete — loop */
-        /* ret  < 0: frame error (CRC or length), loop and re-sync     */
+        /* ret == 0: no byte available yet — loop (non-blocking)   */
+        /* ret  < 0: frame error (CRC / length) — loop and re-sync */
     }
 }

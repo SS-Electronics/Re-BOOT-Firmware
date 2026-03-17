@@ -3,8 +3,8 @@ File:        transport.c
 Author:      Subhajit Roy
              subhajitroy005@gmail.com
 
-Module:      Comm
-Info:        Communication Abstraction — packet framing for UART / CAN
+Module:      comm
+Info:        Transport layer — packet framing, CRC16, send/receive for UART / CAN
 Dependency:  None
 
 This file is part of Re-BOOT Firmware Project.

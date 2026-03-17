@@ -3,8 +3,8 @@ File:        drv_uart.c
 Author:      Subhajit Roy
              subhajitroy005@gmail.com
 
-Module:      Driver
-Info:        UART Driver Abstraction
+Module:      driver
+Info:        UART driver abstraction — transmit / receive / ring-buffer forwarding
 Dependency:  None
 
 This file is part of Re-BOOT Firmware Project.

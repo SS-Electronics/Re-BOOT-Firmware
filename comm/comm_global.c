@@ -3,8 +3,8 @@ File:        comm_global.c
 Author:      Subhajit Roy
              subhajitroy005@gmail.com
 
-Module:      Include
-Info:        Global Data for communication
+Module:      comm
+Info:        Shared communication state and global variables
 Dependency:  None
 
 This file is part of Re-BOOT Firmware Project.

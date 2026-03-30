@@ -215,7 +215,7 @@ static void handle_reset_req(void)
     reset_sector_state();
 
     /* ---- Build RESP_TARGET_INFO payload ----------------------------- */
-    response_packet.command = RESP_TARGET_INFO;
+    response_packet.command = (RESP_TARGET_INFO + BL_NODE_NUMBER);
     response_packet.length  = 8;
 
     /* Flash start address — 4 bytes, MSB first */
@@ -446,7 +446,7 @@ static void process_command(const comm_packet_t *pkt)
 {
     switch (pkt->command)
     {
-        case CMD_RESET_REQ:
+        case (CMD_RESET_REQ + BL_NODE_NUMBER):
             /* Session start — send target parameters to the host */
             handle_reset_req();
             break;
